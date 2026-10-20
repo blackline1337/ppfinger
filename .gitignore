@@ -1,0 +1,11 @@
+# Virtual environment (this repo's venv lives alongside the script)
+Scripts/
+Lib/
+Include/
+pyvenv.cfg
+
+# Scan output
+form_results-*.txt
+
+__pycache__/
+*.pyc
