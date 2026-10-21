@@ -33,67 +33,94 @@ worth testing.
    keeps only PHP and ASP/ASP.NET forms (Java/JSP and JSON/REST API
    endpoints are skipped), and writes each one out as a ready-to-run
    `curl` command.
-6. **Optional extras** — a bounded rate-limit probe to catch edge/CDN
+6. **Multi-target mode** — pipe a list of targets (e.g. a subdomain list)
+   on stdin instead of passing one on the command line; it scans each in
+   turn and keeps going past unreachable ones instead of aborting the batch.
+7. **Optional extras** — a bounded rate-limit probe to catch edge/CDN
    throttling, routing through Tor, and a random browser User-Agent.
 
 ## Install
+
+### Option A: `uv tool install` (recommended — installs `ppfngr` on PATH)
+
+```bash
+git clone git@github.com:blackline1337/ppfinger.git
+cd ppfinger
+./install.sh
+```
+
+This installs `ppfngr` as an isolated [uv](https://docs.astral.sh/uv/) tool
+(its own environment, no venv activation needed) and puts a shim on PATH —
+run it as `ppfngr` from anywhere afterward. Re-run `./install.sh` any time
+after pulling changes to reinstall. Requires `uv`
+(`curl -LsSf https://astral.sh/uv/install.sh | sh` if you don't have it).
+
+### Option B: plain venv
 
 ```bash
 git clone git@github.com:blackline1337/ppfinger.git
 cd ppfinger
 python -m venv .venv
-.venv\Scripts\activate      # Windows
-# source .venv/bin/activate # Linux/macOS
+source .venv/bin/activate   # Linux/macOS
+# .venv\Scripts\activate    # Windows
 pip install -r requirements.txt
 ```
 
 ## Usage
 
 ```
-python ppfinger.py <target> [options]
+ppfngr <target> [options]                      # after ./install.sh
+python ppfinger.py <target> [options]           # plain venv
 ```
 
 Basic scan (WAF fingerprint + tamper suggestions + form crawl):
 
 ```bash
-python ppfinger.py https://target.example.com
+ppfngr https://target.example.com
+```
+
+Multi-target mode — pipe a list of targets, one per line, instead of a
+single positional target:
+
+```bash
+cat subdomains.txt | ppfngr
 ```
 
 WAF/tamper check only, skip the form crawl:
 
 ```bash
-python ppfinger.py https://target.example.com --no-crawl
+ppfngr https://target.example.com --no-crawl
 ```
 
 Deeper crawl, slower pace, custom output directory:
 
 ```bash
-python ppfinger.py https://target.example.com --max-pages 25 --delay 1.0 --out-dir ./results
+ppfngr https://target.example.com --max-pages 25 --delay 1.0 --out-dir ./results
 ```
 
 Also check for rate-limit-based protection:
 
 ```bash
-python ppfinger.py https://target.example.com --rate-probe --rate-probe-count 15
+ppfngr https://target.example.com --rate-probe --rate-probe-count 15
 ```
 
 Route everything through Tor (requires a running Tor client):
 
 ```bash
-python ppfinger.py https://target.example.com --tor
+ppfngr https://target.example.com --tor
 ```
 
 Use a random browser User-Agent instead of ppfngr's own:
 
 ```bash
-python ppfinger.py https://target.example.com --random-agent
+ppfngr https://target.example.com --random-agent
 ```
 
 ### Options
 
 | Flag | Default | Description |
 |---|---|---|
-| `target` | — | Target base URL. Scheme defaults to `https://` if omitted. |
+| `target` | — | Target base URL. Scheme defaults to `https://` if omitted. Omit this entirely and pipe a list of targets on stdin (one per line, blank lines and `#` comments ignored) for multi-target mode — it keeps going past unreachable targets instead of aborting the batch, and exits non-zero if any target was unreachable. |
 | `--max-pages N` | `10` | Max pages to crawl for forms. |
 | `--delay N` | `0.5` | Delay (seconds) between requests. |
 | `--out-dir DIR` | `.` | Directory to write `form_results-<target>.txt` into. |

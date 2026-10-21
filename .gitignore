@@ -9,3 +9,7 @@ form_results-*.txt
 
 __pycache__/
 *.pyc
+
+# Build artifacts (uv build / uv tool install)
+dist/
+*.egg-info/

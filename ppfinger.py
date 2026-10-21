@@ -966,7 +966,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="WAF fingerprinter + sqlmap tamper recommender + PHP/ASP(X) form finder."
     )
-    parser.add_argument("target", help="Target base URL, e.g. https://target.example.com")
+    parser.add_argument("target", nargs="?", default=None,
+                         help="Target base URL, e.g. https://target.example.com. Omit this and pipe "
+                              "a list of targets (one per line) on stdin instead for multi-target mode, "
+                              "e.g. `cat subdomains.txt | python ppfinger.py`.")
     parser.add_argument("--max-pages", type=int, default=10, help="Max pages to crawl for forms (default 10)")
     parser.add_argument("--delay", type=float, default=0.5, help="Delay between requests in seconds (default 0.5)")
     parser.add_argument("--out-dir", default=".", help="Directory to write form_results-<target>.txt into")
@@ -993,23 +996,34 @@ def main():
     else:
         print_banner()
 
-    target = args.target
-    if not target.startswith(("http://", "https://")):
-        target = "https://" + target
-
-    session = requests.Session()
-    if args.random_agent:
-        user_agent = random.choice(RANDOM_USER_AGENTS)
-        print(c_dim(f"[*] --random-agent: using '{user_agent}'"))
+    # Target resolution: either the positional arg, or -- if omitted -- a
+    # list of targets piped on stdin, one per line (blank lines and #
+    # comments ignored), e.g. `cat subdomains.txt | python ppfinger.py`.
+    if args.target:
+        targets = [args.target]
+    elif not sys.stdin.isatty():
+        targets = [
+            line.strip() for line in sys.stdin
+            if line.strip() and not line.strip().startswith("#")
+        ]
     else:
-        user_agent = DEFAULT_UA
-    session.headers.update({"User-Agent": user_agent})
+        parser.error("no target given and stdin isn't piped -- pass a target, or pipe a list of "
+                      "targets on stdin (e.g. `cat subdomains.txt | python ppfinger.py`)")
 
+    if not targets:
+        print(c_bad("[-] No targets to scan (stdin was empty)."))
+        sys.exit(1)
+
+    # Tor is set up once for the whole run (one exit circuit for every
+    # target), not re-verified per target.
+    tor_proxies = None
     if args.tor:
         print(c_info(f"[*] Routing through Tor (127.0.0.1:{args.tor_port})..."))
-        is_tor, info = setup_tor_session(session, args.tor_port)
+        probe_session = requests.Session()
+        is_tor, info = setup_tor_session(probe_session, args.tor_port)
         if is_tor is True:
             print(c_ok(f"[+] Confirmed exiting through Tor. Exit IP: {info}"))
+            tor_proxies = dict(probe_session.proxies)
         elif is_tor is False:
             print(c_bad(f"[!] Proxy reachable but Tor Project does not confirm a Tor exit "
                         f"(reported IP: {info}) -- refusing to continue over a connection that "
@@ -1020,6 +1034,43 @@ def main():
             print(c_bad("    --tor was requested but Tor is not reachable -- stopping "
                         "(no silent fallback to a direct connection)."))
             sys.exit(1)
+
+    multi = len(targets) > 1
+    results = []
+    for i, raw_target in enumerate(targets):
+        if multi:
+            print(c_bold(c_mag(f"\n{'=' * 70}\n[{i + 1}/{len(targets)}] {raw_target}\n{'=' * 70}")))
+        results.append(run_target(raw_target, args, tor_proxies))
+
+    if multi:
+        ok_count = sum(1 for r in results if r)
+        print(c_bold(f"\n{'=' * 70}"))
+        print(c_bold(f"Done: {c_ok(str(ok_count))} reachable / {len(results)} target(s) scanned."))
+
+    sys.exit(0 if all(results) else 1)
+
+
+def run_target(raw_target, args, tor_proxies=None):
+    """Runs the full pipeline (TLS check, WAF fingerprint, tamper
+    suggestions, form crawl) against one target. Returns True if the target
+    was reachable and the pipeline completed, False if it was unreachable
+    (so multi-target mode can keep going to the next one instead of
+    aborting the whole batch)."""
+    _SEEN_ERRORS.clear()  # per-target: don't let one target's dedupe counts bleed into the next
+
+    target = raw_target
+    if not target.startswith(("http://", "https://")):
+        target = "https://" + target
+
+    session = requests.Session()
+    if tor_proxies:
+        session.proxies.update(tor_proxies)
+    if args.random_agent:
+        user_agent = random.choice(RANDOM_USER_AGENTS)
+        print(c_dim(f"[*] --random-agent: using '{user_agent}'"))
+    else:
+        user_agent = DEFAULT_UA
+    session.headers.update({"User-Agent": user_agent})
 
     print(c_bold(f">> Target: {c_mag(target)}"))
 
@@ -1033,7 +1084,7 @@ def main():
     if baseline is None:
         print(c_bad("\n[-] No connection to host -- target is unreachable. Nothing further to check."))
         print_error_summary()
-        sys.exit(1)
+        return False
 
     parsed_target = urlparse.urlsplit(target)
     if parsed_target.scheme == "https":
@@ -1109,7 +1160,7 @@ def main():
     if args.no_crawl:
         print(c_dim("\n[*] --no-crawl set, skipping form discovery."))
         print_error_summary()
-        return
+        return True
 
     section("Crawling for forms", "3/4")
     print(f"  max {args.max_pages} pages, {args.delay}s delay")
@@ -1129,7 +1180,7 @@ def main():
     if not kept:
         print(c_warn("\n[-] No PHP or ASP/ASP.NET forms found; nothing written."))
         print_error_summary()
-        return
+        return True
 
     fname = f"form_results-{sanitize_filename(target)}.txt"
     os.makedirs(args.out_dir, exist_ok=True)
@@ -1146,6 +1197,7 @@ def main():
 
     print(c_ok(f"\n[+] Wrote {len(kept)} curl command(s) to {c_bold(out_path)}"))
     print_error_summary()
+    return True
 
 
 if __name__ == "__main__":
