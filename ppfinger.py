@@ -105,28 +105,35 @@ def c_mag(msg):
     return f"{Fore.MAGENTA}{msg}{Style.RESET_ALL}"
 
 
-def status_color(code):
-    """Color a status code (or 'ERR') by what it means: 2xx/3xx green-ish,
-    4xx/5xx red (likely a WAF/block), anything else dim."""
-    if code == "ERR" or code is None:
-        return c_bad("ERR")
-    if 200 <= code < 400:
-        return c_ok(str(code))
-    if code in (401, 403, 406, 429, 999):
-        return c_bad(str(code))
-    if 400 <= code < 600:
-        return c_warn(str(code))
-    return c_dim(str(code))
+# Severity -> color, loosely matching nuclei's own convention (info=cyan,
+# low=green, medium=yellow, high=red, critical=bold red).
+_SEVERITY_COLOR = {
+    "info": c_info,
+    "low": c_ok,
+    "medium": c_warn,
+    "high": c_bad,
+    "critical": lambda s: c_bold(c_bad(s)),
+}
 
 
-def section(title, step=None):
-    """Prints a colored section header with a horizontal rule, e.g.
-    '-- [1/4] Fingerprinting WAF/CDN --------------'. Plain ASCII only --
-    some Windows consoles are stuck on a legacy codepage (cp1252) that
-    can't encode Unicode box-drawing characters."""
-    label = f"[{step}] {title}" if step else title
-    rule_len = max(4, 60 - len(label))
-    print(c_bold(c_mag(f"\n-- {label} {'-' * rule_len}")))
+def finding(fid, protocol, severity, target, detail=""):
+    """Prints one result in nuclei's own compact line format:
+    `[template-id] [protocol] [severity] matched-at  extra-info`, each
+    bracketed field colored on its own (id bold, protocol dim, severity by
+    level). This is the main unit of output -- one line per check, nothing
+    to scroll past, the way `nuclei` itself reads."""
+    sev_color = _SEVERITY_COLOR.get(severity, c_dim)
+    line = f"{c_bold('[' + fid + ']')} {c_dim('[' + protocol + ']')} {sev_color('[' + severity + ']')} {target}"
+    if detail:
+        line += f" {c_dim(detail)}"
+    print(line)
+
+
+def sub(line):
+    """A dim, indented continuation line under the finding above it (extra
+    context -- probe statuses, tamper script breakdown -- that belongs to
+    that result but would clutter the single-line format itself)."""
+    print(c_dim(f"      {line}"))
 
 
 # Plain-ASCII fallback wordmark, used only if pyfiglet isn't installed for
@@ -1037,15 +1044,14 @@ def main():
 
     multi = len(targets) > 1
     results = []
-    for i, raw_target in enumerate(targets):
+    for raw_target in targets:
         if multi:
-            print(c_bold(c_mag(f"\n{'=' * 70}\n[{i + 1}/{len(targets)}] {raw_target}\n{'=' * 70}")))
+            print()  # run_target prints its own bold target line -- just space successive targets apart
         results.append(run_target(raw_target, args, tor_proxies))
 
     if multi:
         ok_count = sum(1 for r in results if r)
-        print(c_bold(f"\n{'=' * 70}"))
-        print(c_bold(f"Done: {c_ok(str(ok_count))} reachable / {len(results)} target(s) scanned."))
+        print(c_bold(f"\n[*] Done: {c_ok(str(ok_count))} reachable / {len(results)} target(s) scanned."))
 
     sys.exit(0 if all(results) else 1)
 
@@ -1072,113 +1078,91 @@ def run_target(raw_target, args, tor_proxies=None):
         user_agent = DEFAULT_UA
     session.headers.update({"User-Agent": user_agent})
 
-    print(c_bold(f">> Target: {c_mag(target)}"))
+    print(c_bold(c_mag(target)))
+    result_count = 0
 
     # Reachability check up front: if we can't even get a baseline response,
     # every later step (TLS check, WAF probes, tamper suggestions, form
     # crawl) would just fail the exact same way again and again. Bail here
     # with one clear line instead of repeating the same connection error
-    # through 4 sections -- this baseline is then reused by detect_waf()
-    # below so the target isn't hit twice for it.
+    # through every check.
     baseline = fetch(session, target)
     if baseline is None:
-        print(c_bad("\n[-] No connection to host -- target is unreachable. Nothing further to check."))
+        print(c_bad("[-] No connection to host -- target is unreachable. Nothing further to check."))
         print_error_summary()
         return False
 
     parsed_target = urlparse.urlsplit(target)
     if parsed_target.scheme == "https":
-        section("Checking TLS certificate", "0/4")
         port = parsed_target.port or 443
         cert = check_tls_cert(parsed_target.hostname, port)
         if cert["valid"] is True:
-            print(c_ok(f"  [+] SSL cert is valid for {parsed_target.hostname} "
-                       f"(issuer: {cert['issuer_cn']}, expires: {cert['not_after']})"))
+            finding("tls-cert", "ssl", "info", target,
+                    f"valid, issuer={cert['issuer_cn']}, expires={cert['not_after']}")
+            result_count += 1
         elif cert["valid"] is False:
-            print(c_warn("  [!] SSL cert NOT valid for the target -- informational only, not blocking:"))
-            print(c_warn(f"      Reason:      {cert['error']}"))
-            print(c_warn(f"      Cert is for: {cert['subject_cn']}"
-                         f"{c_bold(' (self-signed)') if cert['self_signed'] else ''}"))
-            if cert["sans"]:
-                print(c_warn(f"      SAN(s):      {', '.join(cert['sans'])}"))
-            print(c_warn(f"      Issued by:   {cert['issuer_cn']}"))
-            print(c_warn(f"      Expires:     {cert['not_after']}"))
-            print(c_dim(f"      -> cert on the wire belongs to '{cert['subject_cn']}', not "
-                        f"'{parsed_target.hostname}' -- a browser would show an insecure-connection warning here."))
-        else:
-            print(c_dim(f"  TLS handshake didn't complete: {cert['error']}"))
+            mismatch = f", not matching '{parsed_target.hostname}'" if cert['subject_cn'] != parsed_target.hostname else ""
+            detail = (f"{cert['error']} -- issued to {cert['subject_cn']}"
+                      f"{' (self-signed)' if cert['self_signed'] else ''}{mismatch}, expires {cert['not_after']}")
+            finding("tls-cert", "ssl", "medium", target, detail)
+            result_count += 1
+        # cert["valid"] is None (handshake never completed) isn't printed as
+        # its own finding -- it's the same root cause the baseline-reachability
+        # check above would already have reported.
 
-    section("Fingerprinting WAF / CDN", "1/4")
     waf_result = detect_waf(session, target, delay=args.delay, baseline=baseline)
     matched = waf_result["matched"]
-
-    if baseline is not None:
-        print(f"  Baseline status:          {status_color(baseline.status_code)}")
-    for name, resp in waf_result["probes"].items():
-        status = resp.status_code if resp is not None else "ERR"
-        print(f"  Probe ({name:<9}) status: {status_color(status)}")
-
     heuristic = waf_result["sqlmap_heuristic"]
-    if heuristic["ratio"] is not None:
-        if heuristic["flagged"]:
-            tag = c_bad("BLOCKED-LIKE")
-        else:
-            tag = c_ok("similar to baseline")
-        print(f"  sqlmap-style heuristic (diff ratio {heuristic['ratio']:.2f}): {tag}")
+
+    probe_summary = " ".join(
+        f"{name}={resp.status_code if resp is not None else 'ERR'}"
+        for name, resp in waf_result["probes"].items()
+    )
+    ratio_summary = f"ratio={heuristic['ratio']:.2f}" if heuristic["ratio"] is not None else ""
 
     if matched:
-        print(c_bad(f"\n  [+] Detected WAF(s)/protection: {c_bold(', '.join(matched))}"))
+        finding("waf-detect", "http", "info", target, ", ".join(matched))
     else:
-        print(c_ok("\n  [-] No known WAF signature matched (target may be unprotected, or using an unlisted WAF)."))
+        finding("waf-detect", "http", "info", target, "no known WAF signature matched")
+    sub(f"probes: {probe_summary}  {ratio_summary}".strip())
+    result_count += 1
 
     if args.rate_probe:
-        print(c_info(f"\n  --rate-probe: firing {args.rate_probe_count} back-to-back requests..."))
         rp = rate_probe(session, target, count=args.rate_probe_count)
-        colored_statuses = [status_color(s) for s in rp["statuses"]]
-        print(f"  Statuses: [{', '.join(colored_statuses)}]")
         if rp["rate_limited_at"]:
-            print(c_bad(f"  [+] Rate-limit response seen at request #{rp['rate_limited_at']} "
-                        f"-- target has edge/CDN rate-limiting (a form of WAF protection)"))
+            finding("rate-limit", "http", "low", target,
+                    f"rate-limited at request #{rp['rate_limited_at']} of {args.rate_probe_count}")
         else:
-            print(c_ok("  No rate-limiting observed in this burst."))
+            finding("rate-limit", "http", "info", target,
+                    f"no rate-limiting in a burst of {args.rate_probe_count}")
+        result_count += 1
 
-    section("sqlmap tamper script recommendations", "2/4")
-    if matched:
-        for waf in matched:
-            tampers = TAMPER_MAP.get(waf, TAMPER_MAP["Generic / Unknown WAF"])
-            print(c_bold(c_warn(f"\n  == {waf} ==")))
-            for name, reason in tampers:
-                print(f"    --tamper={c_ok(f'{name:<22}')} {c_dim(reason)}")
-            tamper_list = ",".join(t[0] for t in tampers)
-            print(c_bold(f"\n  >> sqlmap --tamper={tamper_list}"))
-    else:
-        print("  No WAF matched; tamper scripts likely unnecessary. If injections still fail,")
-        print("  try the generic set below as a first pass:")
-        for name, reason in TAMPER_MAP["Generic / Unknown WAF"]:
-            print(f"    --tamper={c_ok(f'{name:<22}')} {c_dim(reason)}")
+    tampers = TAMPER_MAP.get(matched[0], TAMPER_MAP["Generic / Unknown WAF"]) if matched else TAMPER_MAP["Generic / Unknown WAF"]
+    tamper_list = ",".join(t[0] for t in tampers)
+    sub(f"sqlmap --tamper={tamper_list}")
+    for name, reason in tampers:
+        sub(f"  {name:<20} {reason}")
 
     if args.no_crawl:
-        print(c_dim("\n[*] --no-crawl set, skipping form discovery."))
+        print(c_dim(f"\n[*] {result_count} result(s). --no-crawl set, skipping form discovery."))
         print_error_summary()
         return True
 
-    section("Crawling for forms", "3/4")
-    print(f"  max {args.max_pages} pages, {args.delay}s delay")
     forms, pages_fetched, composer_exposed = crawl_for_forms(session, target, args.max_pages, args.delay)
-    print(f"  Fetched {pages_fetched} page(s), found {len(forms)} form(s) total.")
     if composer_exposed:
-        print(c_warn("  [+] composer.json/composer.lock is exposed -- confirmed PHP (likely Laravel/Composer-based)"))
+        finding("composer-disclosure", "http", "low", target, "composer.json/composer.lock is exposed (confirms PHP)")
+        result_count += 1
 
     kept = [f for f in forms if f["tech"] in ("PHP", "ASP", "ASPX")]
     skipped = [f for f in forms if f["tech"] in ("JAVA", "API")]
-    unknown = [f for f in forms if f["tech"] == "UNKNOWN"]
 
-    print(f"  Kept (PHP/ASP/ASPX): {c_ok(str(len(kept)))}")
-    print(f"  Skipped (Java/API):  {c_dim(str(len(skipped)))}")
-    print(f"  Unknown tech:        {c_dim(str(len(unknown)))} (not written out)")
+    for f in kept:
+        finding("form-detect", "http", "info", f["action"], f"{f['method'].upper()} {f['tech']}")
+        result_count += 1
 
     if not kept:
-        print(c_warn("\n[-] No PHP or ASP/ASP.NET forms found; nothing written."))
+        print(c_dim(f"\n[*] {result_count} result(s). Crawled {pages_fetched} page(s), "
+                    f"{len(skipped)} Java/API form(s) skipped, no PHP/ASP(X) forms found; nothing written."))
         print_error_summary()
         return True
 
@@ -1195,7 +1179,7 @@ def run_target(raw_target, args, tor_proxies=None):
             fh.write(f"# Method:   {f['method'].upper()}  Tech: {f['tech']}\n")
             fh.write(build_curl(f) + "\n\n")
 
-    print(c_ok(f"\n[+] Wrote {len(kept)} curl command(s) to {c_bold(out_path)}"))
+    print(c_ok(f"\n[+] {result_count} result(s). Wrote {len(kept)} curl command(s) to {c_bold(out_path)}"))
     print_error_summary()
     return True
 
