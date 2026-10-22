@@ -22,7 +22,11 @@ worth testing.
    Flags interception even when no vendor signature matches.
 3. **sqlmap tamper script recommendations** — maps whatever was detected
    to a ranked list of `--tamper` scripts with a one-line reason each,
-   plus a ready-to-paste `sqlmap --tamper=...` flag.
+   plus a ready-to-paste `sqlmap --tamper=...` flag. With `--verify-tampers`,
+   it goes further: applies each tamper script for real to an attack
+   payload, resends it, and ranks them by how close the response comes
+   back to the clean baseline (likely bypass) vs. still looking blocked —
+   an actual empirical result instead of a guess by vendor name.
 4. **TLS certificate check** — flags a self-signed / hostname-mismatched /
    expired cert as an informational warning (who it's actually issued to,
    who signed it, when it expires) without ever blocking the scan.
@@ -116,6 +120,14 @@ Use a random browser User-Agent instead of ppfngr's own:
 ppfngr https://target.example.com --random-agent
 ```
 
+Actually test the suggested tamper scripts instead of just naming them —
+applies each one to a real attack payload, resends it, and ranks them by
+how close the response comes back to the clean baseline:
+
+```bash
+ppfngr https://target.example.com --verify-tampers
+```
+
 ### Options
 
 | Flag | Default | Description |
@@ -130,6 +142,7 @@ ppfngr https://target.example.com --random-agent
 | `--tor` | off | Route all traffic through a local Tor SOCKS proxy. Aborts immediately if Tor isn't reachable (no silent fallback to a direct connection). |
 | `--tor-port N` | `9050` | Local Tor SOCKS port to use with `--tor`. |
 | `--random-agent` | off | Use a random, common browser User-Agent instead of ppfngr's own. |
+| `--verify-tampers` | off | Apply each suggested tamper script to sqlmap's own kitchen-sink attack payload, resend it, and rank the results by how close the response comes back to the clean baseline (likely bypass) vs. still looking blocked. Only runs when a WAF was detected; adds one extra request per suggested tamper script. |
 | `--no-color` | off | Disable colored output and the startup banner. |
 
 ### Output

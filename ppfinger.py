@@ -46,6 +46,7 @@ import random
 import re
 import socket
 import ssl
+import string
 import sys
 import time
 import urllib.parse as urlparse
@@ -469,6 +470,236 @@ TAMPER_MAP = {
 
 
 # --------------------------------------------------------------------------
+# 2b. Tamper verification (--verify-tampers)
+#
+# Rather than just suggesting tampers by vendor name, actually apply each
+# one to sqlmap's own kitchen-sink attack payload (SQLMAP_IPS_WAF_CHECK_PAYLOAD,
+# the same one sqlmap_waf_heuristic() uses) and resend it, then compare the
+# response against the clean baseline page with the same similarity-ratio
+# technique sqlmap itself uses for checkWaf(). A ratio near 1.0 means the
+# response looks just like an ordinary page again (the tamper likely got
+# past whatever blocked the untampered payload); a ratio near 0 means it
+# still looks like a block page.
+#
+# These are practical reimplementations of the real tamper/*.py scripts in
+# the sqlmap source (same regexes/algorithms, ported from the actual
+# source), not byte-exact -- in particular randomcase/multiplespaces/
+# versionedkeywords use a small hand-picked SQL keyword set here instead of
+# sqlmap's full kb.keywords list, since we're only ever tampering our own
+# synthetic probe payload, not arbitrary user-supplied SQL.
+# --------------------------------------------------------------------------
+
+SQL_KEYWORDS = {
+    "AND", "OR", "SELECT", "UNION", "ALL", "NULL", "FROM", "WHERE", "TABLE", "TABLES",
+    "SCHEMA", "INFORMATION_SCHEMA", "CONCAT", "CHAR", "CAST", "EXEC", "EXECUTE", "AS",
+    "WAITFOR", "DELAY", "SLEEP", "BENCHMARK", "DROP", "INSERT", "UPDATE", "DELETE",
+    "ORDER", "BY", "GROUP", "HAVING", "LIKE", "BETWEEN", "CASE", "WHEN", "THEN",
+    "ELSE", "END", "XP_CMDSHELL", "IFNULL", "CURRENT_USER",
+}
+
+
+def _tamper_space2comment(payload):
+    if not payload:
+        return payload
+    out = []
+    quote = doublequote = firstspace = False
+    for i, ch in enumerate(payload):
+        if not firstspace:
+            if ch.isspace():
+                firstspace = True
+                out.append("/**/")
+                continue
+        elif ch == "'" and (i == 0 or payload[i - 1] != "\\"):
+            quote = not quote
+        elif ch == '"' and (i == 0 or payload[i - 1] != "\\"):
+            doublequote = not doublequote
+        elif ch == " " and not doublequote and not quote:
+            out.append("/**/")
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
+def _tamper_space2plus(payload):
+    if not payload:
+        return payload
+    out = []
+    quote = doublequote = firstspace = False
+    for i, ch in enumerate(payload):
+        if not firstspace:
+            if ch.isspace():
+                firstspace = True
+                out.append("+")
+                continue
+        elif ch == "'" and (i == 0 or payload[i - 1] != "\\"):
+            quote = not quote
+        elif ch == '"' and (i == 0 or payload[i - 1] != "\\"):
+            doublequote = not doublequote
+        elif ch == " " and not doublequote and not quote:
+            out.append("+")
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
+def _tamper_charunicodeescape(payload):
+    if not payload:
+        return payload
+    out = []
+    i = 0
+    while i < len(payload):
+        if payload[i] == "%" and i < len(payload) - 2 and payload[i + 1] in string.hexdigits and payload[i + 2] in string.hexdigits:
+            out.append("\\u00%s" % payload[i + 1:i + 3])
+            i += 3
+        else:
+            out.append("\\u%04X" % ord(payload[i]))
+            i += 1
+    return "".join(out)
+
+
+def _tamper_charencode(payload):
+    if not payload:
+        return payload
+    out = []
+    i = 0
+    while i < len(payload):
+        if payload[i] == "%" and i < len(payload) - 2 and payload[i + 1] in string.hexdigits and payload[i + 2] in string.hexdigits:
+            out.append(payload[i:i + 3])
+            i += 3
+        else:
+            out.append("%%%.2X" % ord(payload[i]))
+            i += 1
+    return "".join(out)
+
+
+def _tamper_overlongutf8(payload):
+    if not payload:
+        return payload
+    out = []
+    i = 0
+    while i < len(payload):
+        if payload[i] == "%" and i < len(payload) - 2 and payload[i + 1] in string.hexdigits and payload[i + 2] in string.hexdigits:
+            out.append(payload[i:i + 3])
+            i += 3
+        else:
+            ch = payload[i]
+            if ch not in string.ascii_letters + string.digits:
+                ordv = ord(ch)
+                if ordv <= 0x7FF:
+                    out.append("%%%.2X%%%.2X" % (0xc0 + (ordv >> 6), 0x80 + (ordv & 0x3f)))
+                else:
+                    out.append("".join("%%%.2X" % b for b in ch.encode("utf8")))
+            else:
+                out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def _tamper_apostrophemask(payload):
+    return payload.replace("'", "%EF%BC%87") if payload else payload
+
+
+def _tamper_randomcase(payload):
+    if not payload:
+        return payload
+
+    def repl(m):
+        word = m.group()
+        if word.upper() in SQL_KEYWORDS:
+            return "".join(c.upper() if random.randint(0, 1) else c.lower() for c in word)
+        return word
+
+    return re.sub(r"\b[A-Za-z_]{2,}\b", repl, payload)
+
+
+def _tamper_multiplespaces(payload):
+    if not payload:
+        return payload
+    words = []
+    for m in re.finditer(r"\b[A-Za-z_]+\b", payload):
+        w = m.group()
+        if w.upper() in SQL_KEYWORDS and w not in words:
+            words.append(w)
+    out = payload
+    for w in words:
+        out = re.sub(
+            r"(?<=\W)%s(?=[^A-Za-z_(]|\Z)" % re.escape(w),
+            lambda m, w=w: " " * random.randint(1, 4) + w + " " * random.randint(1, 4),
+            out,
+        )
+    return out
+
+
+def _tamper_versionedkeywords(payload):
+    if not payload:
+        return payload
+
+    def repl(m):
+        word = m.group("word")
+        if word.upper() in SQL_KEYWORDS:
+            return m.group().replace(word, "/*!%s*/" % word)
+        return m.group()
+
+    out = re.sub(r"(?:^|(?<=\W))(?P<word>[A-Za-z_]+)(?=[^\w(]|\Z)", repl, payload)
+    return out.replace(" /*!", "/*!").replace("*/ ", "*/")
+
+
+def _tamper_equaltolike(payload):
+    if not payload:
+        return payload
+    return re.sub(r"\s*(?<![<>!=])=(?!=)\s*", " LIKE ", payload)
+
+
+def _tamper_between(payload):
+    if not payload:
+        return payload
+    retVal = payload
+    m = re.search(r"(?i)(\b(AND|OR)\b\s+)(?!.*\b(AND|OR)\b)([^>]+?)\s*(?<![<])>(?!=)\s*([^>]+)\s*\Z", payload)
+    if m:
+        repl = "%s %s NOT BETWEEN 0 AND %s" % (m.group(2), m.group(4), m.group(5))
+        retVal = retVal.replace(m.group(0), repl)
+    else:
+        retVal = re.sub(r"\s*(?<![<])>(?!=)\s*(\d+|'[^']+'|\w+\(\d+\))", r" NOT BETWEEN 0 AND \g<1>", payload)
+
+    if retVal == payload:
+        m2 = re.search(r"(?i)(\b(AND|OR)\b\s+)(?!.*\b(AND|OR)\b)([^=]+?)\s*(?<![<>!])=(?!=)\s*([\w()]+)\s*", payload)
+        if m2:
+            repl = "%s %s BETWEEN %s AND %s" % (m2.group(2), m2.group(4), m2.group(5), m2.group(5))
+            retVal = retVal.replace(m2.group(0), repl)
+
+    retVal = re.sub(r"(?i)(\bWHEN\s+)([\w.]+)\s*(?<![<>!])=(?!=)\s*([\w.]+)(?=\s)",
+                     r"\g<1>\g<2> BETWEEN \g<3> AND \g<3>", retVal)
+    return retVal
+
+
+def _tamper_greatest(payload):
+    if not payload:
+        return payload
+    retVal = payload
+    m = re.search(r"(?i)(\b(AND|OR)\b\s+)([^>]+?)\s*>\s*(\w+|'[^']+')", payload)
+    if m:
+        repl = "%sGREATEST(%s,%s+1)=%s" % (m.group(1), m.group(3), m.group(4), m.group(3))
+        retVal = retVal.replace(m.group(0), repl)
+    return retVal
+
+
+TAMPER_FUNCTIONS = {
+    "space2comment": _tamper_space2comment,
+    "space2plus": _tamper_space2plus,
+    "charunicodeescape": _tamper_charunicodeescape,
+    "charencode": _tamper_charencode,
+    "overlongutf8": _tamper_overlongutf8,
+    "apostrophemask": _tamper_apostrophemask,
+    "randomcase": _tamper_randomcase,
+    "multiplespaces": _tamper_multiplespaces,
+    "versionedkeywords": _tamper_versionedkeywords,
+    "equaltolike": _tamper_equaltolike,
+    "between": _tamper_between,
+    "greatest": _tamper_greatest,
+}
+
+
+# --------------------------------------------------------------------------
 # 3. HTTP helpers
 # --------------------------------------------------------------------------
 
@@ -681,6 +912,66 @@ def detect_waf(session, base_url, delay=0.3, baseline=None):
         "probes": probes,
         "sqlmap_heuristic": {"flagged": sqlmap_flagged, "ratio": sqlmap_ratio, "response": sqlmap_probe},
     }
+
+
+# Confidence bands for verify_tampers()'s ratio, same SQLMAP_IPS_WAF_CHECK_RATIO
+# (0.5) sqlmap itself uses as the "still looks blocked" cutoff, plus a higher
+# band above which the response looks close enough to the clean baseline to
+# call it a likely bypass rather than just "not clearly still blocked".
+TAMPER_LIKELY_BYPASS_RATIO = 0.85
+
+
+def verify_tampers(session, base_url, baseline, tampers, delay=0.3):
+    """For each candidate (name, reason) tamper script, actually transforms
+    sqlmap's own kitchen-sink attack payload with it and resends it, then
+    diffs the response against the clean baseline page with the same
+    similarity-ratio technique sqlmap_waf_heuristic() uses. Returns a list
+    of dicts sorted by ratio descending (best chance of working first) --
+    a ratio near 1.0 means the response now looks like an ordinary page
+    again (likely bypassed whatever blocked the untampered payload); a
+    ratio near 0 means it still looks like a block page. A hard
+    bypassed/blocked cutoff would hide exactly this gradient, which is the
+    actual useful signal for picking which tamper to try first."""
+    results = []
+    for name, reason in tampers:
+        func = TAMPER_FUNCTIONS.get(name)
+        if func is None:
+            results.append({"name": name, "reason": reason, "ratio": None, "status": "untested"})
+            continue
+
+        transformed = func(SQLMAP_IPS_WAF_CHECK_PAYLOAD)
+        if transformed == SQLMAP_IPS_WAF_CHECK_PAYLOAD:
+            # this tamper doesn't change our synthetic payload at all (e.g. no
+            # '>' or '=' for between/equaltolike/greatest to grab onto) --
+            # nothing new was actually tested, so don't claim a result
+            results.append({"name": name, "reason": reason, "ratio": None, "status": "no-op"})
+            continue
+
+        if delay:
+            time.sleep(delay)
+        # tamper outputs like charencode/overlongutf8/charunicodeescape are
+        # already percent- or backslash-escaped; re-escaping their '%' with
+        # the normal quote() would double-encode and corrupt them, so keep
+        # '%' as a safe (already-encoded) character here, unlike _probe_url_for().
+        sep = "&" if urlparse.urlsplit(base_url).query else "?"
+        probe_url = base_url + sep + "ppfinger=" + urlparse.quote(transformed, safe="%")
+        resp = fetch(session, probe_url)
+        if resp is None:
+            results.append({"name": name, "reason": reason, "ratio": None, "status": "error"})
+            continue
+
+        ratio = difflib.SequenceMatcher(None, baseline.text, resp.text or "").quick_ratio()
+        if ratio >= TAMPER_LIKELY_BYPASS_RATIO:
+            status = "likely-bypass"
+        elif ratio >= SQLMAP_IPS_WAF_CHECK_RATIO:
+            status = "uncertain"
+        else:
+            status = "still-blocked"
+        results.append({"name": name, "reason": reason, "ratio": ratio, "status": status})
+
+    # Best chance of working first; untested/no-op/error (ratio=None) sink to the bottom.
+    results.sort(key=lambda r: r["ratio"] if r["ratio"] is not None else -1, reverse=True)
+    return results
 
 
 def rate_probe(session, base_url, count=10):
@@ -995,6 +1286,12 @@ def main():
     parser.add_argument("--random-agent", action="store_true",
                          help="Use a random, common browser User-Agent instead of ppfinger's own "
                               "(some WAF rules key off a scanner-looking UA)")
+    parser.add_argument("--verify-tampers", action="store_true",
+                         help="Actually apply each suggested sqlmap tamper script to a real attack "
+                              "payload and resend it, ranking them by how close the response comes "
+                              "back to the clean baseline (likely bypass) vs. still looking blocked, "
+                              "instead of just suggesting by vendor name. Only runs when a WAF was "
+                              "detected; adds one extra request per suggested tamper script.")
     args = parser.parse_args()
 
     if args.no_color:
@@ -1138,10 +1435,39 @@ def run_target(raw_target, args, tor_proxies=None):
         result_count += 1
 
     tampers = TAMPER_MAP.get(matched[0], TAMPER_MAP["Generic / Unknown WAF"]) if matched else TAMPER_MAP["Generic / Unknown WAF"]
-    tamper_list = ",".join(t[0] for t in tampers)
-    sub(f"sqlmap --tamper={tamper_list}")
-    for name, reason in tampers:
-        sub(f"  {name:<20} {reason}")
+
+    if args.verify_tampers and matched:
+        verify_results = verify_tampers(session, target, baseline, tampers, delay=args.delay)
+        best = [r for r in verify_results if r["status"] == "likely-bypass"]
+        if best:
+            finding("tamper-verify", "http", "high", target,
+                    f"likely bypass: {best[0]['name']} (ratio={best[0]['ratio']:.2f})")
+        elif any(r["status"] == "uncertain" for r in verify_results):
+            finding("tamper-verify", "http", "medium", target,
+                    "no clear bypass, but some responses weren't a clean block either -- see ratios below")
+        else:
+            finding("tamper-verify", "http", "info", target, "none of the suggested tampers got past this WAF")
+        result_count += 1
+
+        status_label = {
+            "likely-bypass": c_ok("LIKELY BYPASS"),
+            "uncertain": c_warn("UNCERTAIN    "),
+            "still-blocked": c_bad("STILL BLOCKED"),
+            "no-op": c_dim("NO-OP        "),
+            "error": c_warn("ERROR        "),
+            "untested": c_dim("UNTESTED     "),
+        }
+        for r in verify_results:
+            ratio_str = f"{r['ratio']:.2f}" if r["ratio"] is not None else "  - "
+            sub(f"{ratio_str}  {status_label[r['status']]}  {r['name']:<20} {r['reason']}")
+        ranked = ",".join(r["name"] for r in verify_results if r["ratio"] is not None)
+        if ranked:
+            sub(f"sqlmap --tamper={ranked}  (ranked best-chance-first)")
+    else:
+        tamper_list = ",".join(t[0] for t in tampers)
+        sub(f"sqlmap --tamper={tamper_list}")
+        for name, reason in tampers:
+            sub(f"  {name:<20} {reason}")
 
     if args.no_crawl:
         print(c_dim(f"\n[*] {result_count} result(s). --no-crawl set, skipping form discovery."))
