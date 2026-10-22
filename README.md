@@ -1,5 +1,7 @@
 # ppfngr
 
+![ppfngr](assets/hero.png)
+
 A WAF/CDN fingerprinter and sqlmap tamper-script advisor, with a built-in
 PHP/ASP(X) form finder. Point it at a target and it tells you **what's
 protecting it** and **which sqlmap `--tamper` scripts to try first**, then
@@ -145,7 +147,27 @@ ppfngr https://target.example.com --verify-tampers
 | `--verify-tampers` | off | Apply each suggested tamper script to sqlmap's own kitchen-sink attack payload, resend it, and rank the results by how close the response comes back to the clean baseline (likely bypass) vs. still looking blocked. Only runs when a WAF was detected; adds one extra request per suggested tamper script. |
 | `--no-color` | off | Disable colored output and the startup banner. |
 
-### Output
+### Sample output
+
+Nuclei-style: one line per result (`[id] [protocol] [severity] matched-at`),
+colored by severity, with supporting detail on a dim indented line
+underneath instead of a wall of text:
+
+```
+https://example.com
+[tls-cert] [ssl] [info] https://example.com valid, issuer=Cloudflare TLS Issuing ECC CA 3, expires=2026-12-25 22:56:35 UTC
+[waf-detect] [http] [info] https://example.com Cloudflare
+      probes: sqli=200 xss=200 traversal=200 cmdi=200  ratio=1.00
+      sqlmap --tamper=space2comment,between,charunicodeescape,randomcase
+        space2comment        Replaces spaces with /**/ comments to dodge keyword/space-based rules
+        between              Replaces > and = with NOT BETWEEN/BETWEEN to avoid simple operator filters
+        charunicodeescape    URL-encodes chars as %uXXXX, slips past some unicode-naive filters
+        randomcase           Randomizes keyword case (SeLeCt) to beat case-sensitive signatures
+
+[*] 2 result(s). --no-crawl set, skipping form discovery.
+```
+
+### Form results file
 
 Forms kept by the crawler are written to `form_results-<target>.txt`,
 e.g.:
