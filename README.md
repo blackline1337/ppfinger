@@ -56,9 +56,10 @@ cd ppfinger
 ```
 
 This installs `ppfngr` as an isolated [uv](https://docs.astral.sh/uv/) tool
-(its own environment, no venv activation needed) and puts a shim on PATH —
-run it as `ppfngr` from anywhere afterward. Re-run `./install.sh` any time
-after pulling changes to reinstall. Requires `uv`
+(its own environment, no venv activation needed), **in editable mode** —
+the installed `ppfngr` command always reads `ppfinger.py` straight from
+this checkout, so `git pull` (or any local edit) takes effect immediately
+with no need to re-run `./install.sh`. Requires `uv`
 (`curl -LsSf https://astral.sh/uv/install.sh | sh` if you don't have it).
 
 ### Option B: plain venv
