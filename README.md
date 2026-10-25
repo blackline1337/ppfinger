@@ -38,7 +38,11 @@ worth testing.
    body markers (Laravel/Livewire, ThinkPHP, exposed `composer.json`),
    keeps only PHP and ASP/ASP.NET forms (Java/JSP and JSON/REST API
    endpoints are skipped), and writes each one out as a ready-to-run
-   `curl` command.
+   `curl` command. Also prints one overall `[technology]` summary line
+   combining every signal already gathered (baseline page, WAF probes,
+   crawled forms, composer.json exposure) — `PHP/8.2.34` with the exact
+   version when it's exposed, `PHP (unknown version)` when it isn't, same
+   for `ASP`/`ASPX`. Says nothing at all for Java/API/anything else.
 6. **Multi-target mode, concurrent and RAM-conscious** — pipe a list of
    targets (e.g. a subdomain list) on stdin instead of passing one on the
    command line. Built on asyncio: several targets are scanned at once
@@ -174,17 +178,20 @@ colored by severity, with supporting detail on a dim indented line
 underneath instead of a wall of text:
 
 ```
-https://example.com
-[tls-cert] [ssl] [info] https://example.com valid, issuer=Cloudflare TLS Issuing ECC CA 3, expires=2026-12-25 22:56:35 UTC
-[waf-detect] [http] [info] https://example.com Cloudflare
+http://target.example.com/
+[waf-detect] [http] [info] http://target.example.com/ no known WAF signature matched
       probes: sqli=200 xss=200 traversal=200 cmdi=200  ratio=1.00
-      sqlmap --tamper=space2comment,between,charunicodeescape,randomcase
-        space2comment        Replaces spaces with /**/ comments to dodge keyword/space-based rules
-        between              Replaces > and = with NOT BETWEEN/BETWEEN to avoid simple operator filters
-        charunicodeescape    URL-encodes chars as %uXXXX, slips past some unicode-naive filters
-        randomcase           Randomizes keyword case (SeLeCt) to beat case-sensitive signatures
+      sqlmap --tamper=space2comment,charunicodeescape,randomcase,between
+        space2comment        Safe general-purpose first try: breaks naive space/keyword matching
+        charunicodeescape    Safe general-purpose second try: unicode-escapes special chars
+        randomcase           Low-risk: randomizes SQL keyword casing
+        between              Low-risk: swaps > / = for NOT BETWEEN / BETWEEN
+[composer-disclosure] [http] [low] http://target.example.com/ composer.json/composer.lock is exposed (confirms PHP)
+[form-detect] [http] [info] http://target.example.com/login.php POST PHP
+[form-detect] [http] [info] http://target.example.com/search.php GET PHP
+[technology] [http] [info] http://target.example.com/ PHP/8.2.34
 
-[*] 2 result(s). --no-crawl set, skipping form discovery.
+[+] 5 result(s). Wrote 2 curl command(s) to .\form_results-target.example.com.txt
 ```
 
 ### Form results file

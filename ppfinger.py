@@ -1189,6 +1189,13 @@ def detect_tech(resp, html, form_action):
         return "PHP"
     if re.search(r"asp\.net", powered_by, re.I) or re.search(r"asp\.net", server, re.I):
         return "ASPX" if "aspx" in (html or "").lower() else "ASP"
+    # X-AspNet-Version / X-AspNetMvc-Version are ASP.NET-only headers in
+    # their own right -- a reliable signal even when a hardened server has
+    # stripped the generic X-Powered-By/Server "ASP.NET" string but left
+    # these (used for version extraction too, so detection should trust
+    # them the same way it trusts X-Powered-By: PHP).
+    if "x-aspnet-version" in headers or "x-aspnetmvc-version" in headers:
+        return "ASPX"
     if re.search(r"servlet|tomcat|jboss|wildfly|glassfish", server + powered_by, re.I):
         return "JAVA"
 
@@ -1227,6 +1234,73 @@ def detect_tech(resp, html, form_action):
     if action_path == "" or action_path == "/":
         return "UNKNOWN"
     return "UNKNOWN"
+
+
+# PHP exposes its runtime version in X-Powered-By (and sometimes Server,
+# e.g. "Apache/2.4.41 (Ubuntu) PHP/7.4.3") when expose_php isn't disabled.
+# ASP.NET exposes its own version in X-AspNet-Version when that header
+# hasn't been stripped. Classic ASP doesn't expose a version anywhere
+# standard (Server: Microsoft-IIS/10.0 is the IIS version, not ASP's), so
+# "ASP" realistically always comes back with no version found.
+_PHP_VERSION_RE = re.compile(r"PHP/([0-9]+(?:\.[0-9]+){1,2})", re.I)
+
+
+def extract_tech_version(tech, resp):
+    """Pulls a version string for an already-detected PHP/ASP/ASPX
+    technology out of a response's headers, or None if it isn't exposed."""
+    if resp is None:
+        return None
+    if tech == "PHP":
+        for header_val in (resp.headers.get("X-Powered-By", ""), resp.headers.get("Server", "")):
+            m = _PHP_VERSION_RE.search(header_val)
+            if m:
+                return m.group(1)
+        return None
+    if tech in ("ASP", "ASPX"):
+        v = resp.headers.get("X-AspNet-Version")
+        return v.strip() if v else None
+    return None
+
+
+def resolve_technology(responses, kept_forms, composer_exposed):
+    """Combines every signal already gathered during this target's scan --
+    the baseline homepage response, the WAF probe responses (all already
+    fetched for WAF detection, so this costs no extra requests), any forms
+    found while crawling, and composer.json/.lock exposure -- into one
+    overall technology call. Only reports PHP/ASP/ASPX; anything else
+    (Java, an API, unknown) returns None and nothing gets printed for it.
+    Returns (tech, version_or_None) or None."""
+    best_tech = None
+    best_version = None
+    for resp in responses:
+        if resp is None:
+            continue
+        tech = detect_tech(resp, resp.text, "")  # page-level call: no form action to key off
+        if tech in ("PHP", "ASP", "ASPX"):
+            version = extract_tech_version(tech, resp)
+            if best_tech is None:
+                best_tech, best_version = tech, version
+            if version and not best_version:
+                best_version = version
+            if best_version:
+                break  # found a version -- good enough, stop looking
+
+    if best_tech is None:
+        for f in kept_forms:
+            if f["tech"] in ("PHP", "ASP", "ASPX"):
+                best_tech = f["tech"]
+                break
+
+    if best_tech is None and composer_exposed:
+        best_tech = "PHP"  # composer.json/.lock is PHP-only, but carries no runtime version
+
+    if best_tech is None:
+        return None
+    return best_tech, best_version
+
+
+def format_technology(tech, version):
+    return f"{tech}/{version}" if version else f"{tech} (unknown version)"
 
 
 async def probe_composer_disclosure(session, start_url):
@@ -1458,6 +1532,8 @@ def write_batch_report(batch_results, args):
                     continue
                 if r.get("tls"):
                     fh.write(f"TLS: {r['tls']}\n")
+                if r.get("technology"):
+                    fh.write(f"Technology: {r['technology']}\n")
                 fh.write(f"WAF matched: {', '.join(r['waf']['matched']) or 'none'}\n")
                 if r["waf"].get("heuristic_ratio") is not None:
                     fh.write(f"sqlmap heuristic ratio: {r['waf']['heuristic_ratio']:.2f}\n")
@@ -1482,6 +1558,7 @@ def _new_record(target):
         "waf": {"matched": [], "probes": {}, "heuristic_ratio": None},
         "rate_limit": None,
         "tamper_verify": None,
+        "technology": None,  # "PHP/8.2.34" / "ASPX (unknown version)" / etc. -- only PHP/ASP/ASPX ever set this
         "composer_exposed": False,
         "forms_kept": 0,
         "forms_skipped": 0,
@@ -1573,6 +1650,23 @@ async def run_target(raw_target, args, timeout, tor_proxy_url=None):
             record["waf"]["matched"] = matched
             record["waf"]["heuristic_ratio"] = heuristic["ratio"]
 
+            # Already-fetched responses (baseline + the WAF probes) double as
+            # technology-detection signal at zero extra request cost. Folded
+            # in with whatever crawling turns up (kept forms, composer
+            # exposure) at each exit point below via _emit_technology().
+            _tech_responses = [baseline] + list(waf_result["probes"].values())
+
+            def _emit_technology(kept_forms=(), composer_exposed_flag=False):
+                nonlocal result_count
+                resolved = resolve_technology(_tech_responses, list(kept_forms), composer_exposed_flag)
+                if resolved is None:
+                    return  # not PHP/ASP/ASPX -- say nothing, per spec
+                tech, version = resolved
+                label = format_technology(tech, version)
+                finding("technology", "http", "info", target, label)
+                record["technology"] = label
+                result_count += 1
+
             probe_summary = " ".join(
                 f"{name}={resp.status_code if resp is not None else 'ERR'}"
                 for name, resp in waf_result["probes"].items()
@@ -1641,12 +1735,14 @@ async def run_target(raw_target, args, timeout, tor_proxy_url=None):
                 for name, reason in tampers:
                     sub(f"  {name:<20} {reason}")
 
-            record["result_count"] = result_count
-
             if args.no_crawl:
+                _emit_technology()
+                record["result_count"] = result_count
                 _emit(c_dim(f"\n[*] {result_count} result(s). --no-crawl set, skipping form discovery."))
                 print_error_summary()
                 return record
+
+            record["result_count"] = result_count
 
             forms, pages_fetched, composer_exposed = await crawl_for_forms(session, target, args.max_pages, args.delay)
             record["composer_exposed"] = composer_exposed
@@ -1663,6 +1759,7 @@ async def run_target(raw_target, args, timeout, tor_proxy_url=None):
                 finding("form-detect", "http", "info", f["action"], f"{f['method'].upper()} {f['tech']}")
                 result_count += 1
 
+            _emit_technology(kept_forms=kept, composer_exposed_flag=composer_exposed)
             record["result_count"] = result_count
 
             if not kept:
