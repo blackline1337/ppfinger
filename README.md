@@ -39,11 +39,20 @@ worth testing.
    keeps only PHP and ASP/ASP.NET forms (Java/JSP and JSON/REST API
    endpoints are skipped), and writes each one out as a ready-to-run
    `curl` command.
-6. **Multi-target mode** — pipe a list of targets (e.g. a subdomain list)
-   on stdin instead of passing one on the command line; it scans each in
-   turn and keeps going past unreachable ones instead of aborting the batch.
+6. **Multi-target mode, concurrent and RAM-conscious** — pipe a list of
+   targets (e.g. a subdomain list) on stdin instead of passing one on the
+   command line. Built on asyncio: several targets are scanned at once
+   instead of one at a time, with each target's output still printed as
+   one clean, non-interleaved block in submission order. How many run at
+   once is sized automatically from ~25% of available system RAM (override
+   with `--concurrency`), and a live memory watcher pauses *starting* new
+   target scans (never kills ones already running) if system memory climbs
+   past a safety ceiling during a long run. Keeps going past unreachable
+   targets instead of aborting the batch, and writes an aggregate report
+   when it's done — plain text by default, or JSON with `--json`.
 7. **Optional extras** — a bounded rate-limit probe to catch edge/CDN
-   throttling, routing through Tor, and a random browser User-Agent.
+   throttling, routing through Tor (with a higher default timeout, since
+   Tor circuits add real latency), and a random browser User-Agent.
 
 ## Install
 
@@ -131,6 +140,12 @@ how close the response comes back to the clean baseline:
 ppfngr https://target.example.com --verify-tampers
 ```
 
+Scan a subdomain list concurrently and write the aggregate report as JSON:
+
+```bash
+cat subdomains.txt | ppfngr --json --concurrency 8
+```
+
 ### Options
 
 | Flag | Default | Description |
@@ -138,7 +153,7 @@ ppfngr https://target.example.com --verify-tampers
 | `target` | — | Target base URL. Scheme defaults to `https://` if omitted. Omit this entirely and pipe a list of targets on stdin (one per line, blank lines and `#` comments ignored) for multi-target mode — it keeps going past unreachable targets instead of aborting the batch, and exits non-zero if any target was unreachable. |
 | `--max-pages N` | `10` | Max pages to crawl for forms. |
 | `--delay N` | `0.5` | Delay (seconds) between requests. |
-| `--out-dir DIR` | `.` | Directory to write `form_results-<target>.txt` into. |
+| `--out-dir DIR` | `.` | Directory to write `form_results-<target>.txt` (and the multi-target batch report) into. |
 | `--no-crawl` | off | Skip form crawling; only run WAF fingerprinting + tamper suggestions. |
 | `--rate-probe` | off | Fire a small burst of back-to-back requests to check for rate-limit-based protection (e.g. Cloudflare 429s). |
 | `--rate-probe-count N` | `10` | Number of requests to send for `--rate-probe`. |
@@ -146,6 +161,10 @@ ppfngr https://target.example.com --verify-tampers
 | `--tor-port N` | `9050` | Local Tor SOCKS port to use with `--tor`. |
 | `--random-agent` | off | Use a random, common browser User-Agent instead of ppfngr's own. |
 | `--verify-tampers` | off | Apply each suggested tamper script to sqlmap's own kitchen-sink attack payload, resend it, and rank the results by how close the response comes back to the clean baseline (likely bypass) vs. still looking blocked. Only runs when a WAF was detected; adds one extra request per suggested tamper script. |
+| `--timeout N` | `10` (`15` under `--tor`) | Per-request timeout in seconds. Tor circuits add real latency, so the default is higher automatically when `--tor` is set; this always overrides both. |
+| `--concurrency N` | auto (~25% of available RAM) | How many targets to scan at once in multi-target (stdin) mode. Ignored for a single target. |
+| `--max-memory-percent N` | `85` | Live safety ceiling: pause *starting* new target scans (without touching ones already running) while system memory usage is at or above this, resume once it drops back down. Requires `psutil`. |
+| `--json` | off | Multi-target mode only: write the aggregate batch report as `ppfngr-results-<timestamp>.json` instead of a plain-text summary. |
 | `--no-color` | off | Disable colored output and the startup banner. |
 
 ### Sample output
@@ -186,6 +205,16 @@ curl "https://target.example.com/login.php" --data "username=testuser&password=P
 # Method:   GET  Tech: PHP
 curl "https://target.example.com/search.php?q=test&category=all"
 ```
+
+### Multi-target batch report
+
+In multi-target (stdin) mode, once every target has been scanned,
+ppfngr also writes one aggregate report covering the whole batch --
+`ppfngr-results-<timestamp>.txt` by default, or
+`ppfngr-results-<timestamp>.json` with `--json` -- with each target's
+reachability, TLS status, WAF match, tamper-verify result, and form counts.
+This is separate from the per-target `form_results-<target>.txt` curl
+files, which are still written individually as before.
 
 ## Disclaimer
 

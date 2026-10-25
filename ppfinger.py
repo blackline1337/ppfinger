@@ -21,7 +21,7 @@ What it does:
      Retry-After) -- a signal the single-shot probes above can't surface.
   4. Maps any detected WAF(s) to a recommended list of sqlmap --tamper
      scripts (same idea as whatwaf's tamper-suggestion table), with a short
-     rationale for each.
+     rationale for each. With --verify-tampers, actually tests them.
   5. Crawls the target (same-domain only, shallow, rate-limited) looking for
      HTML <form> elements, in the spirit of sqlmap's --forms. For each form
      found, it fingerprints the backend language from the form action
@@ -31,16 +31,26 @@ What it does:
      anything that looks like a JSON/REST API endpoint are skipped). Each
      kept form is written out as a ready-to-run curl command to
      form_results-<target>.txt.
+  6. Runs entirely on asyncio + aiohttp. In multi-target (stdin) mode,
+     several targets are scanned concurrently -- how many is sized from
+     available system RAM by default (~25% of it), with a live memory
+     watcher that pauses starting *new* target scans (without touching
+     ones already in flight) if system memory climbs past a ceiling, so a
+     long subdomain-list run doesn't snowball into an OOM.
 
 Usage:
     python ppfinger.py https://target.example.com
     python ppfinger.py https://target.example.com --max-pages 15 --delay 1.0
     python ppfinger.py https://target.example.com --out-dir ./results
     python ppfinger.py https://target.example.com --rate-probe --rate-probe-count 15
+    cat subdomains.txt | python ppfinger.py --concurrency 8 --json
 """
 
 import argparse
+import asyncio
+import contextvars
 import difflib
+import json
 import os
 import random
 import re
@@ -52,13 +62,19 @@ import time
 import urllib.parse as urlparse
 from collections import deque
 
-import requests
+import aiohttp
+from aiohttp_socks import ProxyConnector
 from bs4 import BeautifulSoup
 from colorama import Fore, Style, init as colorama_init
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 
-requests.packages.urllib3.disable_warnings()  # self-signed lab certs are common
+try:
+    import psutil
+    _HAS_PSUTIL = True
+except ImportError:
+    _HAS_PSUTIL = False
+
 colorama_init()  # makes ANSI colors work on Windows terminals too
 
 # The "ansi_shadow" figlet font (used for the startup banner) is built from
@@ -75,7 +91,17 @@ for _stream in (sys.stdout, sys.stderr):
 
 
 # --------------------------------------------------------------------------
-# 0. Color output helpers
+# 0. Color output + per-target output buffering
+#
+# In multi-target mode several targets are scanned *concurrently*, but
+# their terminal output must stay readable -- one target's block printed
+# whole, never interleaved line-by-line with another's. Each per-target
+# asyncio task gets its own private output buffer and error-dedupe table
+# via contextvars (asyncio.create_task() snapshots a fresh copy of the
+# current context for each task, so .set() inside one task's coroutine
+# never touches another task's copy -- that's what makes this safe without
+# a lock). The buffer is flushed as one atomic print() when that target's
+# scan finishes.
 # --------------------------------------------------------------------------
 
 def c_info(msg):
@@ -106,6 +132,30 @@ def c_mag(msg):
     return f"{Fore.MAGENTA}{msg}{Style.RESET_ALL}"
 
 
+_OUTPUT_BUF = contextvars.ContextVar("ppfngr_output_buf", default=None)
+_SEEN_ERRORS_VAR = contextvars.ContextVar("ppfngr_seen_errors", default=None)
+
+
+def _emit(line=""):
+    """Writes one line to the current task's output buffer if one has been
+    set (inside run_target()), otherwise prints immediately (banner, Tor
+    setup, the final batch summary -- everything that runs outside a
+    per-target task)."""
+    buf = _OUTPUT_BUF.get()
+    if buf is not None:
+        buf.append(line)
+    else:
+        print(line)
+
+
+def _seen_errors():
+    d = _SEEN_ERRORS_VAR.get()
+    if d is None:
+        d = {}
+        _SEEN_ERRORS_VAR.set(d)
+    return d
+
+
 # Severity -> color, loosely matching nuclei's own convention (info=cyan,
 # low=green, medium=yellow, high=red, critical=bold red).
 _SEVERITY_COLOR = {
@@ -127,14 +177,14 @@ def finding(fid, protocol, severity, target, detail=""):
     line = f"{c_bold('[' + fid + ']')} {c_dim('[' + protocol + ']')} {sev_color('[' + severity + ']')} {target}"
     if detail:
         line += f" {c_dim(detail)}"
-    print(line)
+    _emit(line)
 
 
 def sub(line):
     """A dim, indented continuation line under the finding above it (extra
     context -- probe statuses, tamper script breakdown -- that belongs to
     that result but would clutter the single-line format itself)."""
-    print(c_dim(f"      {line}"))
+    _emit(c_dim(f"      {line}"))
 
 
 # Plain-ASCII fallback wordmark, used only if pyfiglet isn't installed for
@@ -175,7 +225,7 @@ def _gradient_lines(text_block, start_rgb, end_rgb):
 # names and the kind of header/cookie strings this tool actually fingerprints
 # on, purely for look/feel. Kept to one short line on purpose (nothing to
 # scroll past) -- see WAF_SIGNATURES and detect_tech() for the real logic.
-_BANNER_FLAVOR = "Cl0udfl4re · Ak4mai · M0dSecur1ty"
+_BANNER_FLAVOR = "Cl0udfl4re \u00b7 Ak4mai \u00b7 M0dSecur1ty"
 
 
 def _pad_center(text, width):
@@ -222,6 +272,7 @@ def print_banner():
 
 
 DEFAULT_TIMEOUT = 10
+DEFAULT_TOR_TIMEOUT = 15  # Tor circuits add real latency -- a 10s timeout would false-positive as "unreachable" often
 DEFAULT_UA = "ppfinger/1.0 (+authorized security testing)"
 
 # A small pool of common, real-world browser UAs for --random-agent. Not
@@ -700,16 +751,19 @@ TAMPER_FUNCTIONS = {
 
 
 # --------------------------------------------------------------------------
-# 3. HTTP helpers
+# 3. HTTP helpers (async, aiohttp-backed)
 # --------------------------------------------------------------------------
 
 def check_tls_cert(hostname, port, timeout=6):
-    """One-shot TLS probe, independent of the requests session (which runs
-    verify=False everywhere else so a bad cert never blocks scanning). This
-    exists purely to surface *what's wrong* with the cert as an
-    informational warning -- hostname mismatch, self-signed, expired, etc.
-    -- not to block or affect anything else. Returns None if the target
-    isn't even listening on TLS at that host:port."""
+    """One-shot TLS probe. This exists purely to surface *what's wrong*
+    with the cert as an informational warning -- hostname mismatch,
+    self-signed, expired, etc. -- not to block or affect anything else.
+    Still uses blocking socket/ssl (there's no asyncio-native equivalent
+    worth the complexity for a two-handshake one-off check); the async
+    call site runs it in a thread executor so it never blocks the event
+    loop or other concurrently-scanned targets. Not used at all when
+    --tor is active, since a raw socket here would bypass the Tor circuit
+    entirely and leak the real source IP to the target -- see run_target()."""
     result = {
         "valid": None, "error": None, "subject_cn": None, "sans": [],
         "issuer_cn": None, "not_after": None, "self_signed": False,
@@ -767,51 +821,73 @@ def check_tls_cert(hostname, port, timeout=6):
 
 
 def _short_error(e):
-    """Collapse requests/urllib3's deeply-nested chained exception text
-    (HTTPSConnectionPool(...): Max retries exceeded ... (Caused by
-    SSLError(SSLError(1, '...'))) ) down to just the one human-readable
-    reason inside it."""
+    """Collapse a chained exception's text (requests/urllib3-style nested
+    "Caused by X(Y(...))" chains, or aiohttp's own often-terse messages)
+    down to one human-readable reason. aiohttp exceptions (e.g. a bare
+    asyncio.TimeoutError) sometimes stringify to an empty string -- falls
+    back to the exception's class name in that case."""
     msg = str(e)
     if "Caused by" in msg:
         msg = msg.split("Caused by", 1)[1].strip()
-    while True:
-        m = re.match(r"^\w+\(\s*", msg)
-        if not m:
-            break
-        msg = msg[m.end():]
-        msg = msg.rstrip(")")
-    msg = re.sub(r"^\d+,\s*", "", msg)  # drop a leading errno like "1, "
-    msg = msg.strip().strip("'\"")
-    return msg or str(e)[:150]
+        while True:
+            m = re.match(r"^\w+\(\s*", msg)
+            if not m:
+                break
+            msg = msg[m.end():]
+            msg = msg.rstrip(")")
+        msg = re.sub(r"^\d+,\s*", "", msg)  # drop a leading errno like "1, "
+        msg = msg.strip().strip("'\"")
+    msg = msg.strip()
+    if not msg:
+        msg = type(e).__name__
+    return msg[:200]
 
 
-# Dedupe repeated identical connection errors (common when a target is
-# simply unreachable/wrong-scheme -- every one of a dozen probes fails with
-# the exact same reason) so the terminal doesn't get spammed with the same
-# line over and over. First occurrence of each distinct reason is shown in
-# full; repeats just bump a counter, surfaced by print_error_summary().
-_SEEN_ERRORS = {}
+class _Resp:
+    """Minimal response shape mirroring the bits of `requests.Response`
+    this tool actually touches (.status_code, .headers, .text, .cookies),
+    built from an aiohttp ClientResponse once its body has been fully read.
+    Keeping this shape means _match_signature()/detect_tech()/etc. didn't
+    need to change at all when the HTTP layer moved from requests to
+    aiohttp -- only fetch() itself and the call sites that await it did."""
+    __slots__ = ("status_code", "headers", "text", "cookies")
+
+    def __init__(self, status_code, headers, text, cookies):
+        self.status_code = status_code
+        self.headers = headers
+        self.text = text
+        self.cookies = cookies
 
 
-def fetch(session, url, timeout=DEFAULT_TIMEOUT):
+async def fetch(session, url, timeout=None):
     try:
-        resp = session.get(url, timeout=timeout, verify=False, allow_redirects=True)
-        return resp
-    except requests.RequestException as e:
+        kwargs = {"allow_redirects": True, "ssl": False}
+        if timeout is not None:
+            kwargs["timeout"] = aiohttp.ClientTimeout(total=timeout)
+        async with session.get(url, **kwargs) as resp:
+            try:
+                text = await resp.text(errors="replace")
+            except (UnicodeDecodeError, LookupError):
+                raw = await resp.read()
+                text = raw.decode("utf-8", errors="replace")
+            return _Resp(resp.status, resp.headers, text, resp.cookies)
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
         reason = _short_error(e)
-        if reason not in _SEEN_ERRORS:
-            print(c_bad(f"[!] Request failed: {reason}"), file=sys.stderr)
-        _SEEN_ERRORS[reason] = _SEEN_ERRORS.get(reason, 0) + 1
+        seen = _seen_errors()
+        if reason not in seen:
+            _emit(c_bad(f"[!] Request failed: {reason}"))
+        seen[reason] = seen.get(reason, 0) + 1
         return None
 
 
 def print_error_summary():
-    if not _SEEN_ERRORS:
+    seen = _seen_errors()
+    if not seen:
         return
-    total = sum(_SEEN_ERRORS.values())
-    extra = total - len(_SEEN_ERRORS)
+    total = sum(seen.values())
+    extra = total - len(seen)
     if extra > 0:
-        print(c_dim(f"\n[*] ({extra} additional request(s) failed with an already-reported reason, suppressed)"))
+        _emit(c_dim(f"\n[*] ({extra} additional request(s) failed with an already-reported reason, suppressed)"))
 
 
 # --------------------------------------------------------------------------
@@ -842,7 +918,7 @@ def _probe_url_for(base_url, payload):
     return base_url + sep + "ppfinger=" + urlparse.quote(payload, safe="")
 
 
-def sqlmap_waf_heuristic(session, base_url, baseline, delay=0.3):
+async def sqlmap_waf_heuristic(session, base_url, baseline, delay=0.3):
     """Re-implements sqlmap's lib/controller/checks.py:checkWaf() heuristic:
     fire ONE request carrying a kitchen-sink SQLi+XSS+traversal+RCE payload
     (sqlmap's own IPS_WAF_CHECK_PAYLOAD, verbatim) and diff its response
@@ -856,8 +932,8 @@ def sqlmap_waf_heuristic(session, base_url, baseline, delay=0.3):
 
     probe_url = _probe_url_for(base_url, SQLMAP_IPS_WAF_CHECK_PAYLOAD)
     if delay:
-        time.sleep(delay)
-    probe = fetch(session, probe_url)
+        await asyncio.sleep(delay)
+    probe = await fetch(session, probe_url)
     if probe is None:
         # connection reset/refused on a hostile-looking payload is itself
         # exactly what sqlmap treats as a positive WAF/IPS signal
@@ -868,23 +944,24 @@ def sqlmap_waf_heuristic(session, base_url, baseline, delay=0.3):
     return flagged, ratio, probe
 
 
-def detect_waf(session, base_url, delay=0.3, baseline=None):
+async def detect_waf(session, base_url, delay=0.3, baseline=None):
     """Return (matched_vendor_names, baseline_resp, probe_responses_by_name,
     sqlmap_heuristic_result). Sends one baseline request (unless one is
-    already supplied -- main() does its own reachability check up front and
-    passes that through, so the target isn't hit twice), then one probe per
-    entry in WAF_PROBE_PAYLOADS (sqli/xss/traversal/cmdi) -- mirroring how
-    wafw00f/whatwaf try several attack *categories* rather than a single
-    payload, since a WAF may only have a rule for one of them -- plus
-    sqlmap's own generic kitchen-sink heuristic as a second opinion."""
+    already supplied -- run_target() does its own reachability check up
+    front and passes that through, so the target isn't hit twice), then
+    one probe per entry in WAF_PROBE_PAYLOADS (sqli/xss/traversal/cmdi) --
+    mirroring how wafw00f/whatwaf try several attack *categories* rather
+    than a single payload, since a WAF may only have a rule for one of
+    them -- plus sqlmap's own generic kitchen-sink heuristic as a second
+    opinion."""
     if baseline is None:
-        baseline = fetch(session, base_url)
+        baseline = await fetch(session, base_url)
 
     probes = {}
     for name, payload in WAF_PROBE_PAYLOADS.items():
         if delay:
-            time.sleep(delay)
-        probes[name] = fetch(session, _probe_url_for(base_url, payload))
+            await asyncio.sleep(delay)
+        probes[name] = await fetch(session, _probe_url_for(base_url, payload))
 
     matched = set()
     all_responses = [baseline] + list(probes.values())
@@ -902,7 +979,7 @@ def detect_waf(session, base_url, delay=0.3, baseline=None):
                 matched.add("Generic / Unknown WAF")
                 break
 
-    sqlmap_flagged, sqlmap_ratio, sqlmap_probe = sqlmap_waf_heuristic(session, base_url, baseline, delay=delay)
+    sqlmap_flagged, sqlmap_ratio, sqlmap_probe = await sqlmap_waf_heuristic(session, base_url, baseline, delay=delay)
     if sqlmap_flagged and not matched:
         matched.add("Generic / Unknown WAF (sqlmap heuristic only)")
 
@@ -921,7 +998,7 @@ def detect_waf(session, base_url, delay=0.3, baseline=None):
 TAMPER_LIKELY_BYPASS_RATIO = 0.85
 
 
-def verify_tampers(session, base_url, baseline, tampers, delay=0.3):
+async def verify_tampers(session, base_url, baseline, tampers, delay=0.3):
     """For each candidate (name, reason) tamper script, actually transforms
     sqlmap's own kitchen-sink attack payload with it and resends it, then
     diffs the response against the clean baseline page with the same
@@ -948,14 +1025,14 @@ def verify_tampers(session, base_url, baseline, tampers, delay=0.3):
             continue
 
         if delay:
-            time.sleep(delay)
+            await asyncio.sleep(delay)
         # tamper outputs like charencode/overlongutf8/charunicodeescape are
         # already percent- or backslash-escaped; re-escaping their '%' with
         # the normal quote() would double-encode and corrupt them, so keep
         # '%' as a safe (already-encoded) character here, unlike _probe_url_for().
         sep = "&" if urlparse.urlsplit(base_url).query else "?"
         probe_url = base_url + sep + "ppfinger=" + urlparse.quote(transformed, safe="%")
-        resp = fetch(session, probe_url)
+        resp = await fetch(session, probe_url)
         if resp is None:
             results.append({"name": name, "reason": reason, "ratio": None, "status": "error"})
             continue
@@ -974,7 +1051,7 @@ def verify_tampers(session, base_url, baseline, tampers, delay=0.3):
     return results
 
 
-def rate_probe(session, base_url, count=10):
+async def rate_probe(session, base_url, count=10):
     """Optional, bounded burst check (default OFF -- pass --rate-probe).
     Fires `count` back-to-back GET requests (no delay) at the same URL and
     watches for a 429/503/Retry-After flip partway through. This is NOT
@@ -985,7 +1062,7 @@ def rate_probe(session, base_url, count=10):
     statuses = []
     rate_limited_at = None
     for i in range(count):
-        resp = fetch(session, base_url, timeout=5)
+        resp = await fetch(session, base_url)
         code = resp.status_code if resp is not None else None
         statuses.append(code)
         if code in (429, 503) and rate_limited_at is None:
@@ -1152,7 +1229,7 @@ def detect_tech(resp, html, form_action):
     return "UNKNOWN"
 
 
-def probe_composer_disclosure(session, start_url):
+async def probe_composer_disclosure(session, start_url):
     """One-shot check for exposed composer.json / composer.lock, same idea
     as nuclei's laravel-eol template: a world-readable composer file is a
     PHP-only artifact (Composer is PHP's package manager), so finding one
@@ -1160,19 +1237,19 @@ def probe_composer_disclosure(session, start_url):
     parsed = urlparse.urlsplit(start_url)
     root = f"{parsed.scheme}://{parsed.netloc}/"
     for path in ("composer.json", "composer.lock"):
-        resp = fetch(session, urlparse.urljoin(root, path))
+        resp = await fetch(session, urlparse.urljoin(root, path))
         if resp is not None and resp.status_code == 200 and re.search(r'"(require|name|packages)"', resp.text or ""):
             return True
     return False
 
 
-def crawl_for_forms(session, start_url, max_pages, delay):
+async def crawl_for_forms(session, start_url, max_pages, delay):
     root_netloc = urlparse.urlsplit(start_url).netloc
     seen = set()
     queue = deque([start_url])
     all_forms = []
     pages_fetched = 0
-    composer_exposed = probe_composer_disclosure(session, start_url)
+    composer_exposed = await probe_composer_disclosure(session, start_url)
 
     while queue and pages_fetched < max_pages:
         url = queue.popleft()
@@ -1183,10 +1260,10 @@ def crawl_for_forms(session, start_url, max_pages, delay):
         if url.lower().endswith(STATIC_EXCLUDE_EXT):
             continue
 
-        resp = fetch(session, url)
+        resp = await fetch(session, url)
         pages_fetched += 1
         if delay:
-            time.sleep(delay)
+            await asyncio.sleep(delay)
         if resp is None or not resp.text:
             continue
 
@@ -1227,7 +1304,95 @@ def build_curl(form):
 
 
 # --------------------------------------------------------------------------
-# 7. Main
+# 7. RAM-conscious concurrency
+#
+# Multi-target mode scans several targets at once via asyncio, which is
+# where the real "faster" win lives (wall-clock time for N targets drops
+# toward the slowest single target in each concurrency-wide batch, instead
+# of the sum of all of them). Two layers keep that from turning into an
+# OOM on a small box:
+#   1. compute_default_concurrency() sizes how many targets to START
+#      scanning at once from a fraction of *available* system RAM, so a
+#      2GB VPS doesn't try to run as wide as a 32GB workstation.
+#   2. MemoryGate is a live safety net on top of that: a background task
+#      that pauses *starting new* target scans (already-running ones are
+#      left alone -- never killed) if system memory climbs past a ceiling
+#      during the run, and resumes once it drops back down.
+# --------------------------------------------------------------------------
+
+DEFAULT_RAM_FRACTION = 0.25        # use ~25% of available RAM to size default concurrency
+EST_MB_PER_WORKER = 60             # rough per-concurrent-target memory budget (session + buffered pages/forms)
+DEFAULT_MAX_MEMORY_PERCENT = 85.0  # live ceiling: pause starting new targets above this system RAM usage
+
+
+def compute_default_concurrency():
+    """Sizes the default number of targets scanned at once from available
+    system RAM (~25% of it, divided into a rough per-worker budget), so
+    ppfngr runs wide and fast on a beefy box but doesn't try to open 30
+    concurrent scans on a 1GB VPS. Falls back to a conservative default of
+    4 if psutil isn't installed or the check fails for any reason."""
+    if not _HAS_PSUTIL:
+        return 4
+    try:
+        available_mb = psutil.virtual_memory().available / (1024 * 1024)
+    except Exception:
+        return 4
+    budget_mb = available_mb * DEFAULT_RAM_FRACTION
+    workers = int(budget_mb / EST_MB_PER_WORKER)
+    return max(1, min(32, workers))
+
+
+class MemoryGate:
+    """Live backpressure for multi-target runs: a background task that
+    periodically checks system memory usage and, if it climbs above
+    max_percent, pauses new target scans from *starting* (anything already
+    running finishes normally -- nothing is killed) until usage drops back
+    down. compute_default_concurrency() picks a sane starting width; this
+    is the safety net for when real usage runs higher than estimated (a
+    target with huge HTML pages, a slow one holding buffers open, etc). A
+    no-op if psutil isn't installed -- the gate just stays permanently open."""
+
+    def __init__(self, max_percent=DEFAULT_MAX_MEMORY_PERCENT, check_interval=1.0):
+        self.max_percent = max_percent
+        self.check_interval = check_interval
+        self.ok = asyncio.Event()
+        self.ok.set()
+        self._task = None
+        self._paused_announced = False
+
+    async def _watch(self):
+        while True:
+            try:
+                pct = psutil.virtual_memory().percent
+            except Exception:
+                pct = 0.0
+            if pct >= self.max_percent:
+                if not self._paused_announced:
+                    print(c_warn(f"[!] Memory usage at {pct:.0f}% -- pausing new target scans "
+                                 f"until it drops below {self.max_percent:g}%"))
+                    self._paused_announced = True
+                self.ok.clear()
+            else:
+                if self._paused_announced:
+                    print(c_ok(f"[*] Memory usage back to {pct:.0f}% -- resuming new target scans"))
+                    self._paused_announced = False
+                self.ok.set()
+            await asyncio.sleep(self.check_interval)
+
+    def start(self):
+        if _HAS_PSUTIL:
+            self._task = asyncio.create_task(self._watch())
+
+    def stop(self):
+        if self._task is not None:
+            self._task.cancel()
+
+    async def wait(self):
+        await self.ok.wait()
+
+
+# --------------------------------------------------------------------------
+# 8. Main
 # --------------------------------------------------------------------------
 
 def sanitize_filename(target):
@@ -1235,32 +1400,300 @@ def sanitize_filename(target):
     return re.sub(r"[^a-zA-Z0-9._-]", "_", netloc)
 
 
-def setup_tor_session(session, tor_port, timeout=10):
-    """Route the session through a local Tor SOCKS proxy (requires PySocks
-    and a running Tor client, e.g. the Tor Browser Bundle or the `tor`
-    service, listening on 127.0.0.1:<tor_port>, default 9050). Uses
-    socks5h:// (the trailing h means DNS resolution happens *through* Tor
-    too, not locally) so the target's hostname is never leaked outside the
-    Tor circuit. Confirms the proxy actually works by hitting Tor Project's
-    own IP-check API before the real scan starts."""
+async def setup_tor(tor_port, timeout):
+    """Validates a local Tor SOCKS proxy (requires aiohttp-socks and a
+    running Tor client, e.g. the Tor Browser Bundle or the `tor` service,
+    listening on 127.0.0.1:<tor_port>, default 9050) by hitting Tor
+    Project's own IP-check API through it before the real scan starts.
+    Uses socks5h:// (the trailing h means DNS resolution happens *through*
+    Tor too, not locally) so the target's hostname is never leaked outside
+    the circuit. Returns (is_tor, info, proxy_url); per-target sessions
+    each build their own fresh ProxyConnector from proxy_url rather than
+    sharing this one, since a connector is tied to one ClientSession's
+    lifetime."""
     proxy_url = f"socks5h://127.0.0.1:{tor_port}"
-    session.proxies.update({"http": proxy_url, "https": proxy_url})
     try:
-        resp = session.get("https://check.torproject.org/api/ip", timeout=timeout, verify=False)
-        data = resp.json()
+        connector = ProxyConnector.from_url(proxy_url)
+        async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+            async with session.get("https://check.torproject.org/api/ip", ssl=False) as resp:
+                data = await resp.json(content_type=None)
         if data.get("IsTor"):
-            return True, data.get("IP")
-        return False, data.get("IP")
-    except requests.RequestException as e:
-        # Trim requests' verbose chained exception text down to the one
-        # line that actually matters (e.g. "actively refused it" = no Tor
-        # client listening on that port).
-        msg = str(e)
-        reason = msg.rsplit("Caused by", 1)[-1].strip(" )") if "Caused by" in msg else msg
-        return None, reason
+            return True, data.get("IP"), proxy_url
+        return False, data.get("IP"), proxy_url
+    except Exception as e:
+        return None, _short_error(e), proxy_url
 
 
-def main():
+def write_batch_report(batch_results, args):
+    """Multi-target mode only: writes one aggregate report covering every
+    target scanned in the run -- JSON (--json) or a plain-text summary
+    otherwise. This is separate from the per-target form_results-*.txt
+    curl files, which are still written individually as before."""
+    os.makedirs(args.out_dir, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+
+    if args.json:
+        path = os.path.join(args.out_dir, f"ppfngr-results-{stamp}.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(batch_results, fh, indent=2)
+    else:
+        path = os.path.join(args.out_dir, f"ppfngr-results-{stamp}.txt")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(f"ppfngr multi-target results -- {stamp}\n")
+            fh.write(f"{len(batch_results)} target(s) scanned\n\n")
+            for r in batch_results:
+                fh.write(f"=== {r['target']} ===\n")
+                fh.write(f"Reachable: {r['reachable']}\n")
+                if not r["reachable"]:
+                    fh.write(f"Error: {r.get('error')}\n\n")
+                    continue
+                if r.get("tls"):
+                    fh.write(f"TLS: {r['tls']}\n")
+                fh.write(f"WAF matched: {', '.join(r['waf']['matched']) or 'none'}\n")
+                if r["waf"].get("heuristic_ratio") is not None:
+                    fh.write(f"sqlmap heuristic ratio: {r['waf']['heuristic_ratio']:.2f}\n")
+                if r.get("rate_limit"):
+                    fh.write(f"Rate limit: {r['rate_limit']}\n")
+                if r.get("tamper_verify"):
+                    fh.write(f"Tamper verify: {r['tamper_verify']}\n")
+                fh.write(f"Forms kept: {r['forms_kept']}  skipped: {r['forms_skipped']}\n")
+                if r.get("form_results_file"):
+                    fh.write(f"Form results file: {r['form_results_file']}\n")
+                fh.write(f"Result count: {r['result_count']}\n\n")
+
+    print(c_ok(f"[+] Wrote batch report ({len(batch_results)} target(s)) to {c_bold(path)}"))
+
+
+def _new_record(target):
+    return {
+        "target": target,
+        "reachable": False,
+        "error": None,
+        "tls": None,
+        "waf": {"matched": [], "probes": {}, "heuristic_ratio": None},
+        "rate_limit": None,
+        "tamper_verify": None,
+        "composer_exposed": False,
+        "forms_kept": 0,
+        "forms_skipped": 0,
+        "form_results_file": None,
+        "result_count": 0,
+    }
+
+
+async def run_target(raw_target, args, timeout, tor_proxy_url=None):
+    """Runs the full pipeline (TLS check, WAF fingerprint, tamper
+    suggestions/verification, form crawl) against one target, inside its
+    own aiohttp session. Always returns a structured result dict (used for
+    the exit code, the multi-target summary line, and --json/text batch
+    reports); prints that target's whole output as one buffered block via
+    _emit(), flushed in the `finally` below regardless of which return
+    path was taken -- this is what keeps concurrently-scanned targets'
+    output from interleaving."""
+    _OUTPUT_BUF.set([])
+    _SEEN_ERRORS_VAR.set({})
+
+    target = raw_target
+    if not target.startswith(("http://", "https://")):
+        target = "https://" + target
+    record = _new_record(target)
+
+    try:
+        if args.random_agent:
+            user_agent = random.choice(RANDOM_USER_AGENTS)
+            _emit(c_dim(f"[*] --random-agent: using '{user_agent}'"))
+        else:
+            user_agent = DEFAULT_UA
+
+        if tor_proxy_url:
+            connector = ProxyConnector.from_url(tor_proxy_url)
+        else:
+            connector = aiohttp.TCPConnector(ssl=False, limit=10)
+
+        async with aiohttp.ClientSession(
+            connector=connector,
+            timeout=aiohttp.ClientTimeout(total=timeout),
+            headers={"User-Agent": user_agent},
+        ) as session:
+            _emit(c_bold(c_mag(target)))
+            result_count = 0
+
+            # Reachability check up front: if we can't even get a baseline
+            # response, every later step would just fail the exact same way
+            # again and again. Bail here with one clear line instead of
+            # repeating the same connection error through every check.
+            baseline = await fetch(session, target)
+            if baseline is None:
+                _emit(c_bad("[-] No connection to host -- target is unreachable. Nothing further to check."))
+                record["error"] = "no connection"
+                print_error_summary()
+                return record
+
+            record["reachable"] = True
+            parsed_target = urlparse.urlsplit(target)
+
+            if parsed_target.scheme == "https":
+                if tor_proxy_url:
+                    # A raw socket here would connect directly, bypassing the
+                    # Tor circuit entirely and leaking the real source IP --
+                    # skip rather than silently deanonymize the scan.
+                    _emit(c_dim("[*] tls-cert check skipped under --tor (would bypass the Tor circuit over a raw socket)"))
+                else:
+                    port = parsed_target.port or 443
+                    loop = asyncio.get_running_loop()
+                    cert = await loop.run_in_executor(None, check_tls_cert, parsed_target.hostname, port, timeout)
+                    if cert["valid"] is True:
+                        detail = f"valid, issuer={cert['issuer_cn']}, expires={cert['not_after']}"
+                        finding("tls-cert", "ssl", "info", target, detail)
+                        record["tls"] = detail
+                        result_count += 1
+                    elif cert["valid"] is False:
+                        mismatch = f", not matching '{parsed_target.hostname}'" if cert['subject_cn'] != parsed_target.hostname else ""
+                        detail = (f"{cert['error']} -- issued to {cert['subject_cn']}"
+                                  f"{' (self-signed)' if cert['self_signed'] else ''}{mismatch}, expires {cert['not_after']}")
+                        finding("tls-cert", "ssl", "medium", target, detail)
+                        record["tls"] = detail
+                        result_count += 1
+                    # cert["valid"] is None (handshake never completed) isn't printed
+                    # as its own finding -- same root cause the reachability check
+                    # above would already have reported.
+
+            waf_result = await detect_waf(session, target, delay=args.delay, baseline=baseline)
+            matched = waf_result["matched"]
+            heuristic = waf_result["sqlmap_heuristic"]
+            record["waf"]["matched"] = matched
+            record["waf"]["heuristic_ratio"] = heuristic["ratio"]
+
+            probe_summary = " ".join(
+                f"{name}={resp.status_code if resp is not None else 'ERR'}"
+                for name, resp in waf_result["probes"].items()
+            )
+            record["waf"]["probes"] = {
+                name: (resp.status_code if resp is not None else None)
+                for name, resp in waf_result["probes"].items()
+            }
+            ratio_summary = f"ratio={heuristic['ratio']:.2f}" if heuristic["ratio"] is not None else ""
+
+            if matched:
+                finding("waf-detect", "http", "info", target, ", ".join(matched))
+            else:
+                finding("waf-detect", "http", "info", target, "no known WAF signature matched")
+            sub(f"probes: {probe_summary}  {ratio_summary}".strip())
+            result_count += 1
+
+            if args.rate_probe:
+                rp = await rate_probe(session, target, count=args.rate_probe_count)
+                if rp["rate_limited_at"]:
+                    detail = f"rate-limited at request #{rp['rate_limited_at']} of {args.rate_probe_count}"
+                    finding("rate-limit", "http", "low", target, detail)
+                    record["rate_limit"] = detail
+                else:
+                    detail = f"no rate-limiting in a burst of {args.rate_probe_count}"
+                    finding("rate-limit", "http", "info", target, detail)
+                    record["rate_limit"] = detail
+                result_count += 1
+
+            tampers = TAMPER_MAP.get(matched[0], TAMPER_MAP["Generic / Unknown WAF"]) if matched else TAMPER_MAP["Generic / Unknown WAF"]
+
+            if args.verify_tampers and matched:
+                verify_results = await verify_tampers(session, target, baseline, tampers, delay=args.delay)
+                best = [r for r in verify_results if r["status"] == "likely-bypass"]
+                if best:
+                    detail = f"likely bypass: {best[0]['name']} (ratio={best[0]['ratio']:.2f})"
+                    finding("tamper-verify", "http", "high", target, detail)
+                    record["tamper_verify"] = detail
+                elif any(r["status"] == "uncertain" for r in verify_results):
+                    detail = "no clear bypass, but some responses weren't a clean block either"
+                    finding("tamper-verify", "http", "medium", target, detail + " -- see ratios below")
+                    record["tamper_verify"] = detail
+                else:
+                    detail = "none of the suggested tampers got past this WAF"
+                    finding("tamper-verify", "http", "info", target, detail)
+                    record["tamper_verify"] = detail
+                result_count += 1
+
+                status_label = {
+                    "likely-bypass": c_ok("LIKELY BYPASS"),
+                    "uncertain": c_warn("UNCERTAIN    "),
+                    "still-blocked": c_bad("STILL BLOCKED"),
+                    "no-op": c_dim("NO-OP        "),
+                    "error": c_warn("ERROR        "),
+                    "untested": c_dim("UNTESTED     "),
+                }
+                for r in verify_results:
+                    ratio_str = f"{r['ratio']:.2f}" if r["ratio"] is not None else "  - "
+                    sub(f"{ratio_str}  {status_label[r['status']]}  {r['name']:<20} {r['reason']}")
+                ranked = ",".join(r["name"] for r in verify_results if r["ratio"] is not None)
+                if ranked:
+                    sub(f"sqlmap --tamper={ranked}  (ranked best-chance-first)")
+            else:
+                tamper_list = ",".join(t[0] for t in tampers)
+                sub(f"sqlmap --tamper={tamper_list}")
+                for name, reason in tampers:
+                    sub(f"  {name:<20} {reason}")
+
+            record["result_count"] = result_count
+
+            if args.no_crawl:
+                _emit(c_dim(f"\n[*] {result_count} result(s). --no-crawl set, skipping form discovery."))
+                print_error_summary()
+                return record
+
+            forms, pages_fetched, composer_exposed = await crawl_for_forms(session, target, args.max_pages, args.delay)
+            record["composer_exposed"] = composer_exposed
+            if composer_exposed:
+                finding("composer-disclosure", "http", "low", target, "composer.json/composer.lock is exposed (confirms PHP)")
+                result_count += 1
+
+            kept = [f for f in forms if f["tech"] in ("PHP", "ASP", "ASPX")]
+            skipped = [f for f in forms if f["tech"] in ("JAVA", "API")]
+            record["forms_kept"] = len(kept)
+            record["forms_skipped"] = len(skipped)
+
+            for f in kept:
+                finding("form-detect", "http", "info", f["action"], f"{f['method'].upper()} {f['tech']}")
+                result_count += 1
+
+            record["result_count"] = result_count
+
+            if not kept:
+                _emit(c_dim(f"\n[*] {result_count} result(s). Crawled {pages_fetched} page(s), "
+                            f"{len(skipped)} Java/API form(s) skipped, no PHP/ASP(X) forms found; nothing written."))
+                print_error_summary()
+                return record
+
+            fname = f"form_results-{sanitize_filename(target)}.txt"
+            os.makedirs(args.out_dir, exist_ok=True)
+            out_path = os.path.join(args.out_dir, fname)
+
+            with open(out_path, "w", encoding="utf-8") as fh:
+                fh.write(f"# ppfinger form results for {target}\n")
+                fh.write(f"# Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                fh.write(f"# {len(kept)} form(s) kept (PHP / ASP / ASP.NET). Java/API forms excluded.\n\n")
+                for f in kept:
+                    fh.write(f"# Found on: {f['page_url']}\n")
+                    fh.write(f"# Method:   {f['method'].upper()}  Tech: {f['tech']}\n")
+                    fh.write(build_curl(f) + "\n\n")
+
+            record["form_results_file"] = out_path
+            _emit(c_ok(f"\n[+] {result_count} result(s). Wrote {len(kept)} curl command(s) to {c_bold(out_path)}"))
+            print_error_summary()
+            return record
+    finally:
+        # Deliberately NOT printed here: this runs the instant *this*
+        # target's own work finishes, which -- since other targets keep
+        # running concurrently in the background regardless of which one
+        # amain() happens to be awaiting -- is not necessarily in the same
+        # order targets were submitted in (a fast failure can finish before
+        # a slow real scan even though it started later). Stashing the
+        # buffered text on the record and letting amain() print it while
+        # awaiting each task *in submission order* is what actually
+        # guarantees ordered, non-interleaved output; printing here would not.
+        buf = _OUTPUT_BUF.get()
+        record["_output"] = "\n".join(buf) if buf else ""
+
+
+async def amain():
     parser = argparse.ArgumentParser(
         description="WAF fingerprinter + sqlmap tamper recommender + PHP/ASP(X) form finder."
     )
@@ -1279,7 +1712,7 @@ def main():
                          help="Number of requests to send for --rate-probe (default 10)")
     parser.add_argument("--tor", action="store_true",
                          help="Route all traffic through a local Tor SOCKS proxy (127.0.0.1:9050 by "
-                              "default). Requires a running Tor client and the PySocks package.")
+                              "default). Requires a running Tor client and the aiohttp-socks package.")
     parser.add_argument("--tor-port", type=int, default=9050,
                          help="Local Tor SOCKS port to use with --tor (default 9050)")
     parser.add_argument("--no-color", action="store_true", help="Disable colored output")
@@ -1292,6 +1725,20 @@ def main():
                               "back to the clean baseline (likely bypass) vs. still looking blocked, "
                               "instead of just suggesting by vendor name. Only runs when a WAF was "
                               "detected; adds one extra request per suggested tamper script.")
+    parser.add_argument("--timeout", type=float, default=None,
+                         help="Per-request timeout in seconds. Default: 10, or 15 under --tor "
+                              "(Tor circuits add real latency -- 10s false-positives as unreachable often).")
+    parser.add_argument("--concurrency", type=int, default=None,
+                         help="How many targets to scan at once in multi-target (stdin) mode. "
+                              "Default: sized automatically from ~25%% of available system RAM "
+                              "(see compute_default_concurrency()). Ignored for a single target.")
+    parser.add_argument("--max-memory-percent", type=float, default=DEFAULT_MAX_MEMORY_PERCENT,
+                         help=f"Live safety ceiling (default {DEFAULT_MAX_MEMORY_PERCENT:.0f}%%): pause "
+                              "starting new target scans while system memory usage is at or above this, "
+                              "resume once it drops back down. Requires psutil.")
+    parser.add_argument("--json", action="store_true",
+                         help="Multi-target mode only: write the aggregate batch report as JSON "
+                              "(ppfngr-results-<timestamp>.json) instead of a plain-text summary.")
     args = parser.parse_args()
 
     if args.no_color:
@@ -1299,6 +1746,10 @@ def main():
         c_info = c_ok = c_warn = c_bad = c_bold = c_dim = c_mag = lambda msg: msg
     else:
         print_banner()
+
+    if not _HAS_PSUTIL:
+        print(c_dim("[*] psutil not installed -- RAM-based concurrency sizing and the memory watcher "
+                    "are disabled (falling back to a fixed default concurrency of 4)."))
 
     # Target resolution: either the positional arg, or -- if omitted -- a
     # list of targets piped on stdin, one per line (blank lines and #
@@ -1318,16 +1769,18 @@ def main():
         print(c_bad("[-] No targets to scan (stdin was empty)."))
         sys.exit(1)
 
+    timeout = args.timeout if args.timeout is not None else (DEFAULT_TOR_TIMEOUT if args.tor else DEFAULT_TIMEOUT)
+
     # Tor is set up once for the whole run (one exit circuit for every
-    # target), not re-verified per target.
-    tor_proxies = None
+    # target); each per-target session builds its own connector from the
+    # validated proxy_url rather than sharing this probe's session/connector.
+    tor_proxy_url = None
     if args.tor:
         print(c_info(f"[*] Routing through Tor (127.0.0.1:{args.tor_port})..."))
-        probe_session = requests.Session()
-        is_tor, info = setup_tor_session(probe_session, args.tor_port)
+        is_tor, info, proxy_url = await setup_tor(args.tor_port, timeout)
         if is_tor is True:
             print(c_ok(f"[+] Confirmed exiting through Tor. Exit IP: {info}"))
-            tor_proxies = dict(probe_session.proxies)
+            tor_proxy_url = proxy_url
         elif is_tor is False:
             print(c_bad(f"[!] Proxy reachable but Tor Project does not confirm a Tor exit "
                         f"(reported IP: {info}) -- refusing to continue over a connection that "
@@ -1340,174 +1793,50 @@ def main():
             sys.exit(1)
 
     multi = len(targets) > 1
-    results = []
-    for raw_target in targets:
+    concurrency = args.concurrency or compute_default_concurrency()
+    if multi:
+        sizing = "fixed default (psutil unavailable)" if not _HAS_PSUTIL else \
+            f"~{DEFAULT_RAM_FRACTION * 100:.0f}% of available RAM"
+        print(c_dim(f"[*] Scanning {len(targets)} target(s), {concurrency} at a time "
+                    f"({sizing}; override with --concurrency)."))
+
+    memory_gate = MemoryGate(max_percent=args.max_memory_percent)
+    memory_gate.start()
+    sem = asyncio.Semaphore(max(1, concurrency))
+
+    async def run_one(raw_target):
+        await memory_gate.wait()
+        async with sem:
+            await memory_gate.wait()  # re-check right before actually starting in case it flipped while queued
+            return await run_target(raw_target, args, timeout, tor_proxy_url)
+
+    # create_task() schedules every target concurrently right away; printing
+    # each one's buffered output here, in submission order, as we await them
+    # back one at a time (rather than printing inside each task as soon as
+    # *it* finishes) is what keeps output non-interleaved and predictable --
+    # a target that fails fast won't jump ahead of one still mid-scan, even
+    # though the actual work is genuinely running concurrently in the background.
+    tasks = [asyncio.create_task(run_one(t)) for t in targets]
+    batch_results = []
+    for task in tasks:
+        record = await task
+        print(record.pop("_output", ""))
+        batch_results.append(record)
         if multi:
-            print()  # run_target prints its own bold target line -- just space successive targets apart
-        results.append(run_target(raw_target, args, tor_proxies))
+            print()
+
+    memory_gate.stop()
 
     if multi:
-        ok_count = sum(1 for r in results if r)
-        print(c_bold(f"\n[*] Done: {c_ok(str(ok_count))} reachable / {len(results)} target(s) scanned."))
+        ok_count = sum(1 for r in batch_results if r["reachable"])
+        print(c_bold(f"[*] Done: {c_ok(str(ok_count))} reachable / {len(batch_results)} target(s) scanned."))
+        write_batch_report(batch_results, args)
 
-    sys.exit(0 if all(results) else 1)
+    sys.exit(0 if all(r["reachable"] for r in batch_results) else 1)
 
 
-def run_target(raw_target, args, tor_proxies=None):
-    """Runs the full pipeline (TLS check, WAF fingerprint, tamper
-    suggestions, form crawl) against one target. Returns True if the target
-    was reachable and the pipeline completed, False if it was unreachable
-    (so multi-target mode can keep going to the next one instead of
-    aborting the whole batch)."""
-    _SEEN_ERRORS.clear()  # per-target: don't let one target's dedupe counts bleed into the next
-
-    target = raw_target
-    if not target.startswith(("http://", "https://")):
-        target = "https://" + target
-
-    session = requests.Session()
-    if tor_proxies:
-        session.proxies.update(tor_proxies)
-    if args.random_agent:
-        user_agent = random.choice(RANDOM_USER_AGENTS)
-        print(c_dim(f"[*] --random-agent: using '{user_agent}'"))
-    else:
-        user_agent = DEFAULT_UA
-    session.headers.update({"User-Agent": user_agent})
-
-    print(c_bold(c_mag(target)))
-    result_count = 0
-
-    # Reachability check up front: if we can't even get a baseline response,
-    # every later step (TLS check, WAF probes, tamper suggestions, form
-    # crawl) would just fail the exact same way again and again. Bail here
-    # with one clear line instead of repeating the same connection error
-    # through every check.
-    baseline = fetch(session, target)
-    if baseline is None:
-        print(c_bad("[-] No connection to host -- target is unreachable. Nothing further to check."))
-        print_error_summary()
-        return False
-
-    parsed_target = urlparse.urlsplit(target)
-    if parsed_target.scheme == "https":
-        port = parsed_target.port or 443
-        cert = check_tls_cert(parsed_target.hostname, port)
-        if cert["valid"] is True:
-            finding("tls-cert", "ssl", "info", target,
-                    f"valid, issuer={cert['issuer_cn']}, expires={cert['not_after']}")
-            result_count += 1
-        elif cert["valid"] is False:
-            mismatch = f", not matching '{parsed_target.hostname}'" if cert['subject_cn'] != parsed_target.hostname else ""
-            detail = (f"{cert['error']} -- issued to {cert['subject_cn']}"
-                      f"{' (self-signed)' if cert['self_signed'] else ''}{mismatch}, expires {cert['not_after']}")
-            finding("tls-cert", "ssl", "medium", target, detail)
-            result_count += 1
-        # cert["valid"] is None (handshake never completed) isn't printed as
-        # its own finding -- it's the same root cause the baseline-reachability
-        # check above would already have reported.
-
-    waf_result = detect_waf(session, target, delay=args.delay, baseline=baseline)
-    matched = waf_result["matched"]
-    heuristic = waf_result["sqlmap_heuristic"]
-
-    probe_summary = " ".join(
-        f"{name}={resp.status_code if resp is not None else 'ERR'}"
-        for name, resp in waf_result["probes"].items()
-    )
-    ratio_summary = f"ratio={heuristic['ratio']:.2f}" if heuristic["ratio"] is not None else ""
-
-    if matched:
-        finding("waf-detect", "http", "info", target, ", ".join(matched))
-    else:
-        finding("waf-detect", "http", "info", target, "no known WAF signature matched")
-    sub(f"probes: {probe_summary}  {ratio_summary}".strip())
-    result_count += 1
-
-    if args.rate_probe:
-        rp = rate_probe(session, target, count=args.rate_probe_count)
-        if rp["rate_limited_at"]:
-            finding("rate-limit", "http", "low", target,
-                    f"rate-limited at request #{rp['rate_limited_at']} of {args.rate_probe_count}")
-        else:
-            finding("rate-limit", "http", "info", target,
-                    f"no rate-limiting in a burst of {args.rate_probe_count}")
-        result_count += 1
-
-    tampers = TAMPER_MAP.get(matched[0], TAMPER_MAP["Generic / Unknown WAF"]) if matched else TAMPER_MAP["Generic / Unknown WAF"]
-
-    if args.verify_tampers and matched:
-        verify_results = verify_tampers(session, target, baseline, tampers, delay=args.delay)
-        best = [r for r in verify_results if r["status"] == "likely-bypass"]
-        if best:
-            finding("tamper-verify", "http", "high", target,
-                    f"likely bypass: {best[0]['name']} (ratio={best[0]['ratio']:.2f})")
-        elif any(r["status"] == "uncertain" for r in verify_results):
-            finding("tamper-verify", "http", "medium", target,
-                    "no clear bypass, but some responses weren't a clean block either -- see ratios below")
-        else:
-            finding("tamper-verify", "http", "info", target, "none of the suggested tampers got past this WAF")
-        result_count += 1
-
-        status_label = {
-            "likely-bypass": c_ok("LIKELY BYPASS"),
-            "uncertain": c_warn("UNCERTAIN    "),
-            "still-blocked": c_bad("STILL BLOCKED"),
-            "no-op": c_dim("NO-OP        "),
-            "error": c_warn("ERROR        "),
-            "untested": c_dim("UNTESTED     "),
-        }
-        for r in verify_results:
-            ratio_str = f"{r['ratio']:.2f}" if r["ratio"] is not None else "  - "
-            sub(f"{ratio_str}  {status_label[r['status']]}  {r['name']:<20} {r['reason']}")
-        ranked = ",".join(r["name"] for r in verify_results if r["ratio"] is not None)
-        if ranked:
-            sub(f"sqlmap --tamper={ranked}  (ranked best-chance-first)")
-    else:
-        tamper_list = ",".join(t[0] for t in tampers)
-        sub(f"sqlmap --tamper={tamper_list}")
-        for name, reason in tampers:
-            sub(f"  {name:<20} {reason}")
-
-    if args.no_crawl:
-        print(c_dim(f"\n[*] {result_count} result(s). --no-crawl set, skipping form discovery."))
-        print_error_summary()
-        return True
-
-    forms, pages_fetched, composer_exposed = crawl_for_forms(session, target, args.max_pages, args.delay)
-    if composer_exposed:
-        finding("composer-disclosure", "http", "low", target, "composer.json/composer.lock is exposed (confirms PHP)")
-        result_count += 1
-
-    kept = [f for f in forms if f["tech"] in ("PHP", "ASP", "ASPX")]
-    skipped = [f for f in forms if f["tech"] in ("JAVA", "API")]
-
-    for f in kept:
-        finding("form-detect", "http", "info", f["action"], f"{f['method'].upper()} {f['tech']}")
-        result_count += 1
-
-    if not kept:
-        print(c_dim(f"\n[*] {result_count} result(s). Crawled {pages_fetched} page(s), "
-                    f"{len(skipped)} Java/API form(s) skipped, no PHP/ASP(X) forms found; nothing written."))
-        print_error_summary()
-        return True
-
-    fname = f"form_results-{sanitize_filename(target)}.txt"
-    os.makedirs(args.out_dir, exist_ok=True)
-    out_path = os.path.join(args.out_dir, fname)
-
-    with open(out_path, "w", encoding="utf-8") as fh:
-        fh.write(f"# ppfinger form results for {target}\n")
-        fh.write(f"# Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        fh.write(f"# {len(kept)} form(s) kept (PHP / ASP / ASP.NET). Java/API forms excluded.\n\n")
-        for f in kept:
-            fh.write(f"# Found on: {f['page_url']}\n")
-            fh.write(f"# Method:   {f['method'].upper()}  Tech: {f['tech']}\n")
-            fh.write(build_curl(f) + "\n\n")
-
-    print(c_ok(f"\n[+] {result_count} result(s). Wrote {len(kept)} curl command(s) to {c_bold(out_path)}"))
-    print_error_summary()
-    return True
+def main():
+    asyncio.run(amain())
 
 
 if __name__ == "__main__":

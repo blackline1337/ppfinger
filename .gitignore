@@ -6,6 +6,8 @@ pyvenv.cfg
 
 # Scan output
 form_results-*.txt
+ppfngr-results-*.txt
+ppfngr-results-*.json
 
 __pycache__/
 *.pyc
