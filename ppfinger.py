@@ -1400,20 +1400,29 @@ def sanitize_filename(target):
     return re.sub(r"[^a-zA-Z0-9._-]", "_", netloc)
 
 
+def _tor_connector(proxy_url):
+    """Builds a fresh ProxyConnector for a Tor SOCKS proxy URL, always with
+    rdns=True -- DNS resolution happens *through* Tor too, not locally, so
+    the target's hostname is never leaked outside the circuit. (requests/
+    PySocks spelled this as a socks5h:// scheme; aiohttp-socks's URL parser
+    doesn't accept that scheme at all -- it's a plain socks5:// URL plus
+    this separate rdns keyword instead.) Centralized here so every call
+    site gets the same behavior instead of risking one that forgets it."""
+    return ProxyConnector.from_url(proxy_url, rdns=True)
+
+
 async def setup_tor(tor_port, timeout):
     """Validates a local Tor SOCKS proxy (requires aiohttp-socks and a
     running Tor client, e.g. the Tor Browser Bundle or the `tor` service,
     listening on 127.0.0.1:<tor_port>, default 9050) by hitting Tor
     Project's own IP-check API through it before the real scan starts.
-    Uses socks5h:// (the trailing h means DNS resolution happens *through*
-    Tor too, not locally) so the target's hostname is never leaked outside
-    the circuit. Returns (is_tor, info, proxy_url); per-target sessions
-    each build their own fresh ProxyConnector from proxy_url rather than
-    sharing this one, since a connector is tied to one ClientSession's
-    lifetime."""
-    proxy_url = f"socks5h://127.0.0.1:{tor_port}"
+    Returns (is_tor, info, proxy_url); per-target sessions each build
+    their own fresh ProxyConnector from proxy_url via _tor_connector()
+    rather than sharing this one, since a connector is tied to one
+    ClientSession's lifetime."""
+    proxy_url = f"socks5://127.0.0.1:{tor_port}"
     try:
-        connector = ProxyConnector.from_url(proxy_url)
+        connector = _tor_connector(proxy_url)
         async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=timeout)) as session:
             async with session.get("https://check.torproject.org/api/ip", ssl=False) as resp:
                 data = await resp.json(content_type=None)
@@ -1506,7 +1515,7 @@ async def run_target(raw_target, args, timeout, tor_proxy_url=None):
             user_agent = DEFAULT_UA
 
         if tor_proxy_url:
-            connector = ProxyConnector.from_url(tor_proxy_url)
+            connector = _tor_connector(tor_proxy_url)
         else:
             connector = aiohttp.TCPConnector(ssl=False, limit=10)
 
