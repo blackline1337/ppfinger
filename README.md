@@ -112,6 +112,21 @@ WAF/tamper check only, skip the form crawl:
 ppfngr https://target.example.com --no-crawl
 ```
 
+Only want the backend technology? `--tech` fetches just the baseline page
+and prints that one result, nothing else:
+
+```bash
+ppfngr https://target.example.com --tech
+```
+
+Only want the forms, not the WAF/tamper battery? `--forms-only` still
+crawls and writes `form_results-*.txt`, but skips WAF probing, tamper
+suggestions/verification, and `--rate-probe`:
+
+```bash
+ppfngr https://target.example.com --forms-only
+```
+
 Deeper crawl, slower pace, custom output directory:
 
 ```bash
@@ -159,6 +174,8 @@ cat subdomains.txt | ppfngr --json --concurrency 8
 | `--delay N` | `0.5` | Delay (seconds) between requests. |
 | `--out-dir DIR` | `.` | Directory to write `form_results-<target>.txt` (and the multi-target batch report) into. |
 | `--no-crawl` | off | Skip form crawling; only run WAF fingerprinting + tamper suggestions. |
+| `--tech` | off | Only detect and print the backend technology (PHP/ASP/ASPX + version if exposed) — skips WAF probing, tamper suggestions, TLS cert check, and the form crawl entirely. Only the baseline page is fetched: fast, but less certain than a full scan since composer.json exposure and discovered forms aren't checked. Mutually exclusive with `--forms-only`. |
+| `--forms-only` | off | Only crawl for and report PHP/ASP(X) forms — skips WAF probing, tamper suggestions/verification, and `--rate-probe`. TLS cert check and the `[technology]` summary still run. Can't be combined with `--no-crawl` (contradictory) or `--tech`. |
 | `--rate-probe` | off | Fire a small burst of back-to-back requests to check for rate-limit-based protection (e.g. Cloudflare 429s). |
 | `--rate-probe-count N` | `10` | Number of requests to send for `--rate-probe`. |
 | `--tor` | off | Route all traffic through a local Tor SOCKS proxy. Aborts immediately if Tor isn't reachable (no silent fallback to a direct connection). |

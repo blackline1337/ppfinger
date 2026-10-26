@@ -1618,6 +1618,25 @@ async def run_target(raw_target, args, timeout, tor_proxy_url=None):
             record["reachable"] = True
             parsed_target = urlparse.urlsplit(target)
 
+            if args.tech:
+                # Fastest, narrowest mode: only the baseline page is ever
+                # fetched -- no WAF probes, no TLS check, no crawl. Less
+                # certain than a full scan, since composer.json exposure and
+                # discovered forms (other signals a full scan also feeds
+                # into resolve_technology()) never get checked here.
+                resolved = resolve_technology([baseline], [], False)
+                if resolved:
+                    tech, version = resolved
+                    label = format_technology(tech, version)
+                    finding("technology", "http", "info", target, label)
+                    record["technology"] = label
+                    result_count = 1
+                else:
+                    _emit(c_dim("[*] Not PHP/ASP/ASPX (or couldn't tell from the baseline page alone)."))
+                record["result_count"] = result_count
+                print_error_summary()
+                return record
+
             if parsed_target.scheme == "https":
                 if tor_proxy_url:
                     # A raw socket here would connect directly, bypassing the
@@ -1644,18 +1663,95 @@ async def run_target(raw_target, args, timeout, tor_proxy_url=None):
                     # as its own finding -- same root cause the reachability check
                     # above would already have reported.
 
-            waf_result = await detect_waf(session, target, delay=args.delay, baseline=baseline)
-            matched = waf_result["matched"]
-            heuristic = waf_result["sqlmap_heuristic"]
-            record["waf"]["matched"] = matched
-            record["waf"]["heuristic_ratio"] = heuristic["ratio"]
+            if args.forms_only:
+                _emit(c_dim("[*] --forms-only set, skipping WAF probing and tamper suggestions."))
+                # No WAF probes fetched -- the baseline page is the only
+                # technology-detection signal available until crawling runs.
+                _tech_responses = [baseline]
+            else:
+                waf_result = await detect_waf(session, target, delay=args.delay, baseline=baseline)
+                matched = waf_result["matched"]
+                heuristic = waf_result["sqlmap_heuristic"]
+                record["waf"]["matched"] = matched
+                record["waf"]["heuristic_ratio"] = heuristic["ratio"]
 
-            # Already-fetched responses (baseline + the WAF probes) double as
-            # technology-detection signal at zero extra request cost. Folded
-            # in with whatever crawling turns up (kept forms, composer
-            # exposure) at each exit point below via _emit_technology().
-            _tech_responses = [baseline] + list(waf_result["probes"].values())
+                # Already-fetched responses (baseline + the WAF probes) double
+                # as technology-detection signal at zero extra request cost.
+                _tech_responses = [baseline] + list(waf_result["probes"].values())
 
+                probe_summary = " ".join(
+                    f"{name}={resp.status_code if resp is not None else 'ERR'}"
+                    for name, resp in waf_result["probes"].items()
+                )
+                record["waf"]["probes"] = {
+                    name: (resp.status_code if resp is not None else None)
+                    for name, resp in waf_result["probes"].items()
+                }
+                ratio_summary = f"ratio={heuristic['ratio']:.2f}" if heuristic["ratio"] is not None else ""
+
+                if matched:
+                    finding("waf-detect", "http", "info", target, ", ".join(matched))
+                else:
+                    finding("waf-detect", "http", "info", target, "no known WAF signature matched")
+                sub(f"probes: {probe_summary}  {ratio_summary}".strip())
+                result_count += 1
+
+                if args.rate_probe:
+                    rp = await rate_probe(session, target, count=args.rate_probe_count)
+                    if rp["rate_limited_at"]:
+                        detail = f"rate-limited at request #{rp['rate_limited_at']} of {args.rate_probe_count}"
+                        finding("rate-limit", "http", "low", target, detail)
+                        record["rate_limit"] = detail
+                    else:
+                        detail = f"no rate-limiting in a burst of {args.rate_probe_count}"
+                        finding("rate-limit", "http", "info", target, detail)
+                        record["rate_limit"] = detail
+                    result_count += 1
+
+                tampers = TAMPER_MAP.get(matched[0], TAMPER_MAP["Generic / Unknown WAF"]) if matched else TAMPER_MAP["Generic / Unknown WAF"]
+
+                if args.verify_tampers and matched:
+                    verify_results = await verify_tampers(session, target, baseline, tampers, delay=args.delay)
+                    best = [r for r in verify_results if r["status"] == "likely-bypass"]
+                    if best:
+                        detail = f"likely bypass: {best[0]['name']} (ratio={best[0]['ratio']:.2f})"
+                        finding("tamper-verify", "http", "high", target, detail)
+                        record["tamper_verify"] = detail
+                    elif any(r["status"] == "uncertain" for r in verify_results):
+                        detail = "no clear bypass, but some responses weren't a clean block either"
+                        finding("tamper-verify", "http", "medium", target, detail + " -- see ratios below")
+                        record["tamper_verify"] = detail
+                    else:
+                        detail = "none of the suggested tampers got past this WAF"
+                        finding("tamper-verify", "http", "info", target, detail)
+                        record["tamper_verify"] = detail
+                    result_count += 1
+
+                    status_label = {
+                        "likely-bypass": c_ok("LIKELY BYPASS"),
+                        "uncertain": c_warn("UNCERTAIN    "),
+                        "still-blocked": c_bad("STILL BLOCKED"),
+                        "no-op": c_dim("NO-OP        "),
+                        "error": c_warn("ERROR        "),
+                        "untested": c_dim("UNTESTED     "),
+                    }
+                    for r in verify_results:
+                        ratio_str = f"{r['ratio']:.2f}" if r["ratio"] is not None else "  - "
+                        sub(f"{ratio_str}  {status_label[r['status']]}  {r['name']:<20} {r['reason']}")
+                    ranked = ",".join(r["name"] for r in verify_results if r["ratio"] is not None)
+                    if ranked:
+                        sub(f"sqlmap --tamper={ranked}  (ranked best-chance-first)")
+                else:
+                    tamper_list = ",".join(t[0] for t in tampers)
+                    sub(f"sqlmap --tamper={tamper_list}")
+                    for name, reason in tampers:
+                        sub(f"  {name:<20} {reason}")
+
+            # Defined after either branch above, so it always sees whatever
+            # technology signal ended up available (WAF probes included when
+            # they ran, baseline-only under --forms-only); folded together
+            # with whatever crawling turns up (kept forms, composer
+            # exposure) at each exit point below.
             def _emit_technology(kept_forms=(), composer_exposed_flag=False):
                 nonlocal result_count
                 resolved = resolve_technology(_tech_responses, list(kept_forms), composer_exposed_flag)
@@ -1666,74 +1762,6 @@ async def run_target(raw_target, args, timeout, tor_proxy_url=None):
                 finding("technology", "http", "info", target, label)
                 record["technology"] = label
                 result_count += 1
-
-            probe_summary = " ".join(
-                f"{name}={resp.status_code if resp is not None else 'ERR'}"
-                for name, resp in waf_result["probes"].items()
-            )
-            record["waf"]["probes"] = {
-                name: (resp.status_code if resp is not None else None)
-                for name, resp in waf_result["probes"].items()
-            }
-            ratio_summary = f"ratio={heuristic['ratio']:.2f}" if heuristic["ratio"] is not None else ""
-
-            if matched:
-                finding("waf-detect", "http", "info", target, ", ".join(matched))
-            else:
-                finding("waf-detect", "http", "info", target, "no known WAF signature matched")
-            sub(f"probes: {probe_summary}  {ratio_summary}".strip())
-            result_count += 1
-
-            if args.rate_probe:
-                rp = await rate_probe(session, target, count=args.rate_probe_count)
-                if rp["rate_limited_at"]:
-                    detail = f"rate-limited at request #{rp['rate_limited_at']} of {args.rate_probe_count}"
-                    finding("rate-limit", "http", "low", target, detail)
-                    record["rate_limit"] = detail
-                else:
-                    detail = f"no rate-limiting in a burst of {args.rate_probe_count}"
-                    finding("rate-limit", "http", "info", target, detail)
-                    record["rate_limit"] = detail
-                result_count += 1
-
-            tampers = TAMPER_MAP.get(matched[0], TAMPER_MAP["Generic / Unknown WAF"]) if matched else TAMPER_MAP["Generic / Unknown WAF"]
-
-            if args.verify_tampers and matched:
-                verify_results = await verify_tampers(session, target, baseline, tampers, delay=args.delay)
-                best = [r for r in verify_results if r["status"] == "likely-bypass"]
-                if best:
-                    detail = f"likely bypass: {best[0]['name']} (ratio={best[0]['ratio']:.2f})"
-                    finding("tamper-verify", "http", "high", target, detail)
-                    record["tamper_verify"] = detail
-                elif any(r["status"] == "uncertain" for r in verify_results):
-                    detail = "no clear bypass, but some responses weren't a clean block either"
-                    finding("tamper-verify", "http", "medium", target, detail + " -- see ratios below")
-                    record["tamper_verify"] = detail
-                else:
-                    detail = "none of the suggested tampers got past this WAF"
-                    finding("tamper-verify", "http", "info", target, detail)
-                    record["tamper_verify"] = detail
-                result_count += 1
-
-                status_label = {
-                    "likely-bypass": c_ok("LIKELY BYPASS"),
-                    "uncertain": c_warn("UNCERTAIN    "),
-                    "still-blocked": c_bad("STILL BLOCKED"),
-                    "no-op": c_dim("NO-OP        "),
-                    "error": c_warn("ERROR        "),
-                    "untested": c_dim("UNTESTED     "),
-                }
-                for r in verify_results:
-                    ratio_str = f"{r['ratio']:.2f}" if r["ratio"] is not None else "  - "
-                    sub(f"{ratio_str}  {status_label[r['status']]}  {r['name']:<20} {r['reason']}")
-                ranked = ",".join(r["name"] for r in verify_results if r["ratio"] is not None)
-                if ranked:
-                    sub(f"sqlmap --tamper={ranked}  (ranked best-chance-first)")
-            else:
-                tamper_list = ",".join(t[0] for t in tampers)
-                sub(f"sqlmap --tamper={tamper_list}")
-                for name, reason in tampers:
-                    sub(f"  {name:<20} {reason}")
 
             if args.no_crawl:
                 _emit_technology()
@@ -1811,6 +1839,18 @@ async def amain():
     parser.add_argument("--delay", type=float, default=0.5, help="Delay between requests in seconds (default 0.5)")
     parser.add_argument("--out-dir", default=".", help="Directory to write form_results-<target>.txt into")
     parser.add_argument("--no-crawl", action="store_true", help="Skip form crawling, only run WAF fingerprinting")
+    scope_group = parser.add_mutually_exclusive_group()
+    scope_group.add_argument("--tech", action="store_true",
+                              help="Only detect and print the backend technology (PHP/ASP/ASPX + version "
+                                   "if exposed) -- skips WAF probing, tamper suggestions, TLS cert check, "
+                                   "and the form crawl entirely. Only the baseline page is fetched, so "
+                                   "it's fast but less certain than a full scan (composer.json exposure "
+                                   "and discovered forms, which a full scan also uses, aren't checked).")
+    scope_group.add_argument("--forms-only", action="store_true",
+                              help="Only crawl for and report PHP/ASP(X) forms -- skips WAF probing, "
+                                   "tamper suggestions/verification, and --rate-probe. TLS cert check and "
+                                   "the [technology] summary (from whatever signals remain available) "
+                                   "still run.")
     parser.add_argument("--rate-probe", action="store_true",
                          help="Also fire a small burst of back-to-back requests to check for "
                               "rate-limit-based protection (e.g. Cloudflare 429s). Off by default.")
@@ -1846,6 +1886,10 @@ async def amain():
                          help="Multi-target mode only: write the aggregate batch report as JSON "
                               "(ppfngr-results-<timestamp>.json) instead of a plain-text summary.")
     args = parser.parse_args()
+
+    if args.forms_only and args.no_crawl:
+        parser.error("--forms-only and --no-crawl contradict each other (--forms-only wants to crawl, "
+                      "--no-crawl says not to)")
 
     if args.no_color:
         global c_info, c_ok, c_warn, c_bad, c_bold, c_dim, c_mag
