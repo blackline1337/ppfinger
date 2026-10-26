@@ -64,6 +64,9 @@ from collections import deque
 
 import aiohttp
 from aiohttp_socks import ProxyConnector
+from aiohttp_socks import ProxyError as _SocksProxyError
+from aiohttp_socks import ProxyConnectionError as _SocksProxyConnectionError
+from aiohttp_socks import ProxyTimeoutError as _SocksProxyTimeoutError
 from bs4 import BeautifulSoup
 from colorama import Fore, Style, init as colorama_init
 from cryptography import x509
@@ -871,7 +874,15 @@ async def fetch(session, url, timeout=None):
                 raw = await resp.read()
                 text = raw.decode("utf-8", errors="replace")
             return _Resp(resp.status, resp.headers, text, resp.cookies)
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError,
+            _SocksProxyError, _SocksProxyConnectionError, _SocksProxyTimeoutError) as e:
+        # aiohttp-socks's own ProxyError/ProxyConnectionError/ProxyTimeoutError
+        # (raised under --tor when the SOCKS proxy itself reports a failure,
+        # e.g. "Connection refused by destination host" -- the Tor circuit
+        # reached the proxy fine but the far end refused) are plain
+        # Exception subclasses, NOT OSError/aiohttp.ClientError, so they
+        # wouldn't be caught above without listing them explicitly -- that
+        # gap is exactly what let one crash the whole run uncaught before.
         reason = _short_error(e)
         seen = _seen_errors()
         if reason not in seen:
