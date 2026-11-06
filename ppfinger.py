@@ -1692,51 +1692,102 @@ class StatsBar(object):
         self._last_net, self._last_net_t = counters, now
         return bytes_delta / dt, pkts_delta / dt
 
-    def _top_panel_lines(self):
-        inner_w = max(10, self.cols - 4)  # content width inside "| " + " |"
+    @staticmethod
+    def _colored_row(segments, inner_w):
+        """Renders a list of (plain_text, color_fn_or_None) segments as one
+        padded, colored line. The padding is computed from the PLAIN text
+        lengths before any color is applied -- an ANSI code has zero
+        visible width but a nonzero len(), so coloring a piece first and
+        then measuring/padding the result (the bug the old single-string
+        version carefully avoided by only coloring once, at the very end)
+        would silently throw that math off. Truncates on the plain length
+        too, for the same reason, then colors only what's kept."""
+        plain_len = sum(len(text) for text, _ in segments)
+        if plain_len > inner_w:
+            # trim segments from the end, by plain length, until it fits
+            kept, used = [], 0
+            for text, color in segments:
+                room = inner_w - used
+                if room <= 0:
+                    break
+                kept.append((text[:room], color))
+                used += len(text[:room])
+            segments = kept
+            plain_len = used
+        colored = "".join(color(text) if color else text for text, color in segments)
+        return colored + " " * max(0, inner_w - plain_len)
+
+    # Plain text only (never pre-colored): _colored_row() measures and pads
+    # every segment's plain text before coloring anything, and pairing this
+    # with c_dim (looked up fresh at call time, like every other segment)
+    # keeps it correct even if --no-color later rebinds c_dim to a no-op --
+    # a *pre-colored* constant evaluated once here at class-definition time
+    # would freeze in whatever c_dim did at import time and never notice.
+    _SEP_TEXT = " " + chr(0x2502) + " "
+
+    def _row1_segments(self):
         elapsed = time.monotonic() - self.start_time
         rate = self.done / elapsed if elapsed > 0 else 0.0
         remaining = self.total - self.done
         eta = (remaining / rate) if rate > 0 else None
+        left_color = c_ok if remaining == 0 else c_warn
+        return [
+            ("targets ", c_dim), (f"{self.done}/{self.total}", c_bold), ("  ", None),
+            (f"left={remaining}", left_color), ("  ", None),
+            (f"concurrency={self.concurrency}", c_dim),
+            (self._SEP_TEXT, c_dim),
+            ("elapsed=", c_dim), (_format_duration(elapsed), c_info), ("  ", None),
+            ("ETA=", c_dim), (_format_duration(eta), c_info), ("  ", None),
+            ("rate=", c_dim), (f"{rate:.2f}/s", c_info),
+        ]
 
-        row1 = (f"targets {self.done}/{self.total}  left={remaining}  concurrency={self.concurrency}  "
-                f"elapsed={_format_duration(elapsed)}  ETA={_format_duration(eta)}  rate={rate:.2f}/s")
+    def _row2_segments(self):
+        if self._proc is None:
+            return [("RAM/net: psutil not installed", c_dim)]
+        try:
+            sysmem = psutil.virtual_memory()
+            proc_rss_mb = self._proc.memory_info().rss / (1024 * 1024)
+            bps, pps = self._sample_network()
+        except Exception:
+            return [("RAM/net: unavailable", c_dim)]
+        ram_color = c_ok if sysmem.percent < 60 else (c_warn if sysmem.percent < 85 else c_bad)
+        return [
+            ("RAM ", c_dim),
+            (f"{sysmem.used / 1e9:.1f}/{sysmem.total / 1e9:.1f}GB ({sysmem.percent:.0f}%)", ram_color),
+            (self._SEP_TEXT, c_dim),
+            ("ppfngr ", c_dim), (f"{proc_rss_mb:.0f}MB", c_info),
+            (self._SEP_TEXT, c_dim),
+            ("net ", c_dim), (f"{_format_rate(bps)}", c_info), ("  ", None), (f"{pps:.0f}pkt/s", c_info),
+        ]
 
-        if self._proc is not None:
-            try:
-                sysmem = psutil.virtual_memory()
-                proc_rss_mb = self._proc.memory_info().rss / (1024 * 1024)
-                bps, pps = self._sample_network()
-                row2 = (f"RAM {sysmem.used / 1e9:.1f}/{sysmem.total / 1e9:.1f}GB ({sysmem.percent:.0f}%)  "
-                        f"ppfngr {proc_rss_mb:.0f}MB  net {_format_rate(bps)}  {pps:.0f}pkt/s")
-            except Exception:
-                row2 = "RAM/net: unavailable"
-        else:
-            row2 = "RAM/net: psutil not installed"
+    def _row3_segments(self):
+        label = "tor latency" if self.tor else "latency"
+        if not _LATENCY_SAMPLES_MS:
+            return [(f"{label}: ", c_dim), ("no samples yet", c_dim)]
+        samples = list(_LATENCY_SAMPLES_MS)
+        avg_ms = sum(samples) / len(samples)
+        last_ms = samples[-1]
+        lat_color = c_ok if avg_ms < 300 else (c_warn if avg_ms < 1000 else c_bad)
+        return [
+            (f"{label}: ", c_dim),
+            ("avg ", c_dim), (f"{avg_ms:.0f}ms", lat_color), ("  ", None),
+            ("last ", c_dim), (f"{last_ms:.0f}ms", lat_color), ("  ", None),
+            (f"(n={len(samples)})", c_dim),
+        ]
 
-        if _LATENCY_SAMPLES_MS:
-            samples = list(_LATENCY_SAMPLES_MS)
-            avg_ms = sum(samples) / len(samples)
-            label = "tor latency" if self.tor else "latency"
-            row3 = f"{label}: avg {avg_ms:.0f}ms  last {samples[-1]:.0f}ms  (n={len(samples)})"
-        else:
-            row3 = ("tor latency" if self.tor else "latency") + ": no samples yet"
+    def _top_panel_lines(self):
+        inner_w = max(10, self.cols - 4)  # content width inside "| " + " |"
 
-        def box_row(text):
-            return chr(0x2502) + " " + text[:inner_w].ljust(inner_w) + " " + chr(0x2502)
+        def box_row(colored_content):
+            return c_mag(chr(0x2502)) + " " + colored_content + " " + c_mag(chr(0x2502))
 
         top = chr(0x250c) + chr(0x2500) * (self.cols - 2) + chr(0x2510)
         bottom = chr(0x2514) + chr(0x2500) * (self.cols - 2) + chr(0x2518)
-        # color applied to each already-sized plain line as a whole, never
-        # interleaved into the padding/truncation math above -- ANSI codes
-        # have zero visible width but a nonzero len(), so coloring a
-        # substring *before* ljust()/slicing would silently throw off
-        # exactly that math
         return [
             c_bold(c_mag(top[:self.cols])),
-            c_bold(box_row(row1)),
-            box_row(row2),
-            box_row(row3),
+            box_row(self._colored_row(self._row1_segments(), inner_w)),
+            box_row(self._colored_row(self._row2_segments(), inner_w)),
+            box_row(self._colored_row(self._row3_segments(), inner_w)),
             c_bold(c_mag(bottom[:self.cols])),
         ]
 
