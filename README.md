@@ -232,13 +232,33 @@ curl "https://target.example.com/search.php?q=test&category=all"
 
 ### Multi-target batch report
 
-In multi-target (stdin) mode, once every target has been scanned,
-ppfngr also writes one aggregate report covering the whole batch --
-`ppfngr-results-<timestamp>.txt` by default, or
-`ppfngr-results-<timestamp>.json` with `--json` -- with each target's
-reachability, TLS status, WAF match, tamper-verify result, and form counts.
-This is separate from the per-target `form_results-<target>.txt` curl
-files, which are still written individually as before.
+In multi-target (stdin) mode, once every target has been scanned, ppfngr
+also writes one aggregate report covering the whole batch. This is
+separate from the per-target `form_results-<target>.txt` curl files,
+which are still written individually as before.
+
+With `--json`, `ppfngr-results-<timestamp>.json` holds every target's
+full raw data, unfiltered (including unreachable ones) -- for scripting.
+
+Without it, `ppfngr-results-<timestamp>.txt` keeps only targets with a
+**positive** result -- PHP/ASP/ASPX detected, a WAF matched, or a form
+found (forms aren't required on their own: a WAF match with zero forms
+still counts). Unreachable targets, and reachable ones where none of
+that turned up anything, are omitted (counted in a one-line summary, not
+silently dropped). Each kept target is rendered in the same nuclei-style
+lines the terminal uses, with one compact addition: the suggested or
+verified tamper scripts are collapsed into a single sqlmap-`--technique`-
+style letter code instead of a full name/reason breakdown, e.g.:
+
+```
+http://target.example.com
+[technology] [http] [info] http://target.example.com PHP/8.2.34
+[waf-detect] [http] [info] http://target.example.com ModSecurity / OWASP CRS
+[waf-tampers] [USRAM] charunicodeescape,space2comment,randomcase,apostrophemask,multiplespaces
+[composer-disclosure] [http] [low] http://target.example.com composer.json/composer.lock is exposed
+[form-detect] [http] [info] http://target.example.com/login.php POST PHP
+      curl commands: .\form_results-target.example.com.txt
+```
 
 ## Disclaimer
 

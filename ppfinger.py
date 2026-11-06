@@ -752,6 +752,36 @@ TAMPER_FUNCTIONS = {
     "greatest": _tamper_greatest,
 }
 
+# One-letter code per tamper script, the same idea as sqlmap's own
+# --technique BEUSQ (one letter per SQLi technique). Used to compress a
+# tamper list down to a single short tag -- e.g. [waf-tampers] [SR] for
+# space2comment+randomcase -- instead of a multi-line name/reason
+# breakdown, in contexts (like the multi-target text batch report) where
+# that breakdown is more noise than signal. The full names/reasons are
+# always still shown in the normal terminal output and in --json.
+TAMPER_CODES = {
+    "space2comment": "S",
+    "randomcase": "R",
+    "between": "B",
+    "charunicodeescape": "U",
+    "apostrophemask": "A",
+    "multiplespaces": "M",
+    "space2plus": "P",
+    "charencode": "E",
+    "overlongutf8": "O",
+    "versionedkeywords": "V",
+    "equaltolike": "L",
+    "greatest": "G",
+}
+
+
+def tamper_code_tag(tamper_names):
+    """Collapses an ordered list of tamper script names into their one-
+    letter codes, e.g. ['space2comment', 'randomcase'] -> 'SR'. Preserves
+    the given order (best-chance-first when it came from --verify-tampers'
+    ranking, vendor-priority-first otherwise) rather than sorting."""
+    return "".join(TAMPER_CODES.get(n, "?") for n in tamper_names)
+
 
 # --------------------------------------------------------------------------
 # 3. HTTP helpers (async, aiohttp-backed)
@@ -1518,11 +1548,31 @@ async def setup_tor(tor_port, timeout):
         return None, _short_error(e), proxy_url
 
 
+def _is_positive_result(r):
+    """A target belongs in the human-facing text batch report if it's
+    reachable AND at least one of: PHP/ASP/ASPX technology detected, a WAF
+    matched, or a PHP/ASP(X) form was found -- forms aren't required on
+    their own. Unreachable targets, and reachable ones where none of that
+    turned up anything, are the "garbled junk" this filters out; --json
+    still gets every target's full raw data, unfiltered, for scripting."""
+    if not r["reachable"]:
+        return False
+    return bool(r.get("technology") or r["waf"]["matched"] or r.get("forms_kept"))
+
+
 def write_batch_report(batch_results, args):
-    """Multi-target mode only: writes one aggregate report covering every
-    target scanned in the run -- JSON (--json) or a plain-text summary
-    otherwise. This is separate from the per-target form_results-*.txt
-    curl files, which are still written individually as before."""
+    """Multi-target mode only: writes one aggregate report covering the
+    run. --json writes every target's full raw data, unfiltered. Without
+    it, the .txt report keeps only targets with a positive result (see
+    _is_positive_result()) and renders each one in the same nuclei-style
+    `[id] [protocol] [severity] target  detail` lines the terminal uses,
+    not a separate hand-rolled label format -- with one compact addition:
+    the suggested/verified tamper scripts are collapsed into a single
+    sqlmap-`--technique`-style letter code (see TAMPER_CODES), e.g.
+    `[waf-tampers] [SR] space2comment,randomcase`, instead of the full
+    per-script name/reason breakdown the terminal shows. This is separate
+    from the per-target form_results-*.txt curl files, which are still
+    written individually as before."""
     os.makedirs(args.out_dir, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
 
@@ -1530,34 +1580,48 @@ def write_batch_report(batch_results, args):
         path = os.path.join(args.out_dir, f"ppfngr-results-{stamp}.json")
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(batch_results, fh, indent=2)
-    else:
-        path = os.path.join(args.out_dir, f"ppfngr-results-{stamp}.txt")
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(f"ppfngr multi-target results -- {stamp}\n")
-            fh.write(f"{len(batch_results)} target(s) scanned\n\n")
-            for r in batch_results:
-                fh.write(f"=== {r['target']} ===\n")
-                fh.write(f"Reachable: {r['reachable']}\n")
-                if not r["reachable"]:
-                    fh.write(f"Error: {r.get('error')}\n\n")
-                    continue
-                if r.get("tls"):
-                    fh.write(f"TLS: {r['tls']}\n")
-                if r.get("technology"):
-                    fh.write(f"Technology: {r['technology']}\n")
-                fh.write(f"WAF matched: {', '.join(r['waf']['matched']) or 'none'}\n")
-                if r["waf"].get("heuristic_ratio") is not None:
-                    fh.write(f"sqlmap heuristic ratio: {r['waf']['heuristic_ratio']:.2f}\n")
-                if r.get("rate_limit"):
-                    fh.write(f"Rate limit: {r['rate_limit']}\n")
-                if r.get("tamper_verify"):
-                    fh.write(f"Tamper verify: {r['tamper_verify']}\n")
-                fh.write(f"Forms kept: {r['forms_kept']}  skipped: {r['forms_skipped']}\n")
-                if r.get("form_results_file"):
-                    fh.write(f"Form results file: {r['form_results_file']}\n")
-                fh.write(f"Result count: {r['result_count']}\n\n")
+        print(c_ok(f"[+] Wrote batch report ({len(batch_results)} target(s)) to {c_bold(path)}"))
+        return
 
-    print(c_ok(f"[+] Wrote batch report ({len(batch_results)} target(s)) to {c_bold(path)}"))
+    path = os.path.join(args.out_dir, f"ppfngr-results-{stamp}.txt")
+    positive = [r for r in batch_results if _is_positive_result(r)]
+    omitted = len(batch_results) - len(positive)
+
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(f"ppfngr multi-target results -- {stamp}\n")
+        fh.write(f"{len(positive)} target(s) with a positive result, of {len(batch_results)} scanned")
+        fh.write(f" ({omitted} unreachable or nothing detected, omitted below)\n\n" if omitted else "\n\n")
+
+        for r in positive:
+            fh.write(f"{r['target']}\n")
+
+            if r.get("technology"):
+                fh.write(f"[technology] [http] [info] {r['target']} {r['technology']}\n")
+
+            if r["waf"]["matched"]:
+                fh.write(f"[waf-detect] [http] [info] {r['target']} {', '.join(r['waf']['matched'])}\n")
+                if r.get("tamper_names"):
+                    codes = tamper_code_tag(r["tamper_names"])
+                    fh.write(f"[waf-tampers] [{codes}] {','.join(r['tamper_names'])}\n")
+                if r.get("tamper_verify"):
+                    fh.write(f"[tamper-verify] [http] [info] {r['target']} {r['tamper_verify']}\n")
+
+            if r.get("rate_limit"):
+                fh.write(f"[rate-limit] [http] [info] {r['target']} {r['rate_limit']}\n")
+
+            if r.get("composer_exposed"):
+                fh.write(f"[composer-disclosure] [http] [low] {r['target']} "
+                         f"composer.json/composer.lock is exposed\n")
+
+            for f in r.get("forms", []):
+                fh.write(f"[form-detect] [http] [info] {f['action']} {f['method'].upper()} {f['tech']}\n")
+            if r.get("form_results_file"):
+                fh.write(f"      curl commands: {r['form_results_file']}\n")
+
+            fh.write("\n")
+
+    print(c_ok(f"[+] Wrote batch report ({len(positive)}/{len(batch_results)} target(s) positive) "
+               f"to {c_bold(path)}"))
 
 
 def _new_record(target):
@@ -1569,10 +1633,12 @@ def _new_record(target):
         "waf": {"matched": [], "probes": {}, "heuristic_ratio": None},
         "rate_limit": None,
         "tamper_verify": None,
+        "tamper_names": [],  # ordered: verify-tampers ranking if that ran, else the static vendor suggestion order
         "technology": None,  # "PHP/8.2.34" / "ASPX (unknown version)" / etc. -- only PHP/ASP/ASPX ever set this
         "composer_exposed": False,
         "forms_kept": 0,
         "forms_skipped": 0,
+        "forms": [],
         "form_results_file": None,
         "result_count": 0,
     }
@@ -1749,11 +1815,13 @@ async def run_target(raw_target, args, timeout, tor_proxy_url=None):
                     for r in verify_results:
                         ratio_str = f"{r['ratio']:.2f}" if r["ratio"] is not None else "  - "
                         sub(f"{ratio_str}  {status_label[r['status']]}  {r['name']:<20} {r['reason']}")
-                    ranked = ",".join(r["name"] for r in verify_results if r["ratio"] is not None)
+                    record["tamper_names"] = [r["name"] for r in verify_results if r["ratio"] is not None]
+                    ranked = ",".join(record["tamper_names"])
                     if ranked:
                         sub(f"sqlmap --tamper={ranked}  (ranked best-chance-first)")
                 else:
-                    tamper_list = ",".join(t[0] for t in tampers)
+                    record["tamper_names"] = [t[0] for t in tampers]
+                    tamper_list = ",".join(record["tamper_names"])
                     sub(f"sqlmap --tamper={tamper_list}")
                     for name, reason in tampers:
                         sub(f"  {name:<20} {reason}")
@@ -1793,6 +1861,7 @@ async def run_target(raw_target, args, timeout, tor_proxy_url=None):
             skipped = [f for f in forms if f["tech"] in ("JAVA", "API")]
             record["forms_kept"] = len(kept)
             record["forms_skipped"] = len(skipped)
+            record["forms"] = [{"action": f["action"], "method": f["method"], "tech": f["tech"]} for f in kept]
 
             for f in kept:
                 finding("form-detect", "http", "info", f["action"], f"{f['method'].upper()} {f['tech']}")
