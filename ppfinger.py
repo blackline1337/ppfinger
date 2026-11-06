@@ -2592,6 +2592,20 @@ async def amain():
                 stats_bar.advance(is_positive=_is_positive_result(record))
             if report_path:
                 write_batch_report(batch_results, args, quiet=True, path=report_path)
+    except KeyboardInterrupt:
+        # Safety net, not the primary path: the SIGINT handler above should
+        # intercept Ctrl+C itself and never let a raw KeyboardInterrupt
+        # reach here at all. But a few real-world delivery paths can still
+        # produce one anyway -- most notably PowerShell, which for a native
+        # process reading piped object-array input (`"a","b" | python.exe
+        # ...`) is documented to sometimes terminate the child directly
+        # instead of going through the normal console Ctrl+C handler chain,
+        # faster than our handler/watcher task gets a chance to run. When
+        # that happens there's no opportunity left to offer the interactive
+        # [c]/[q] prompt -- the stack is already unwinding -- so this just
+        # guarantees the same safe landing a [q] quit gets: whatever
+        # completed is kept and written out, nothing corrupts the terminal.
+        interrupted = True
     finally:
         # Always run, even on an exception/quit mid-loop -- cancels
         # whatever's still in flight (including anything still queued
@@ -2637,7 +2651,17 @@ async def amain():
 
 
 def main():
-    asyncio.run(amain())
+    try:
+        asyncio.run(amain())
+    except KeyboardInterrupt:
+        # Last-resort net: only reachable if a raw interrupt escapes even
+        # amain()'s own try/except KeyboardInterrupt (e.g. during
+        # asyncio.run()'s own teardown, after amain() already returned/
+        # raised) -- a plain traceback here would be the one case nothing
+        # above catches, so this just prints a short line and exits 130
+        # instead.
+        print(c_warn("\n[!] Interrupted."))
+        sys.exit(130)
 
 
 if __name__ == "__main__":
