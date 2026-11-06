@@ -164,6 +164,11 @@ _SEEN_ERRORS_VAR = contextvars.ContextVar("ppfngr_seen_errors", default=None)
 # just drag a real average down misleadingly.
 _LATENCY_SAMPLES_MS = deque(maxlen=50)
 
+# Set once from args.ignore_redirects before any target task starts, then
+# only ever read -- same write-once/read-many sharing as the latency deque
+# above, no contextvar needed.
+IGNORE_REDIRECTS = False
+
 
 def _emit(line=""):
     """Writes one line to the current task's output buffer if one has been
@@ -921,7 +926,7 @@ class _Resp:
 async def fetch(session, url, timeout=None):
     t0 = time.monotonic()
     try:
-        kwargs = {"allow_redirects": True, "ssl": False}
+        kwargs = {"allow_redirects": not IGNORE_REDIRECTS, "ssl": False}
         if timeout is not None:
             kwargs["timeout"] = aiohttp.ClientTimeout(total=timeout)
         async with session.get(url, **kwargs) as resp:
@@ -2109,6 +2114,18 @@ async def run_target(raw_target, args, timeout, tor_proxy_url=None):
             record["reachable"] = True
             parsed_target = urlparse.urlsplit(target)
 
+            if IGNORE_REDIRECTS and 300 <= baseline.status_code < 400:
+                location = baseline.headers.get("Location", "")
+                resolved = urlparse.urljoin(target, location) if location else ""
+                if resolved and urlparse.urlsplit(resolved).path != parsed_target.path:
+                    # Redirects elsewhere (e.g. a login page) are expected,
+                    # benign behavior, not a WAF block or an error -- only a
+                    # plain 200 counts as the "clean" baseline under
+                    # --ignore-redirects, so just note it and move on instead
+                    # of chasing the redirect or flagging it as a problem.
+                    _emit(c_dim(f"[*] --ignore-redirects: {target} -> {baseline.status_code} redirects to "
+                                 f"{resolved} (different page, treated as reachable/fine)"))
+
             if args.tech:
                 # Fastest, narrowest mode: only the baseline page is ever
                 # fetched -- no WAF probes, no TLS check, no crawl. Less
@@ -2423,6 +2440,11 @@ async def amain():
                               "default). Requires a running Tor client and the aiohttp-socks package.")
     parser.add_argument("--tor-port", type=int, default=9050,
                          help="Local Tor SOCKS port to use with --tor (default 9050)")
+    parser.add_argument("--ignore-redirects", action="store_true",
+                         help="Don't follow redirects. A target that 3xx-redirects elsewhere (e.g. to a "
+                              "login page) is still treated as reachable/fine -- only a plain 200 counts "
+                              "as the clean baseline page itself; the redirect destination is never "
+                              "fetched or checked.")
     parser.add_argument("--no-color", action="store_true", help="Disable colored output")
     parser.add_argument("--random-agent", action="store_true",
                          help="Use a random, common browser User-Agent instead of ppfinger's own "
@@ -2457,6 +2479,9 @@ async def amain():
     if args.forms_only and args.no_crawl:
         parser.error("--forms-only and --no-crawl contradict each other (--forms-only wants to crawl, "
                       "--no-crawl says not to)")
+
+    global IGNORE_REDIRECTS
+    IGNORE_REDIRECTS = args.ignore_redirects
 
     if args.no_color:
         global c_info, c_ok, c_warn, c_bad, c_bold, c_dim, c_mag

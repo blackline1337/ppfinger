@@ -195,6 +195,7 @@ cat subdomains.txt | ppfngr --stats
 | `--json` | off | Multi-target mode only: write the aggregate batch report as `ppfngr-results-<timestamp>.json` instead of a plain-text summary. |
 | `--stats` | off | Multi-target mode only: a wfuzz-style live dashboard pinned to the terminal — a stats panel at the **top** (targets done/left/concurrency, elapsed/ETA/rate, system RAM + ppfngr's own memory footprint, network throughput, and request latency — labeled "tor latency" under `--tor`) plus a progress bar at the **bottom**, with normal scan output flowing in between. Needs a real terminal (stdout must be a tty) — silently does nothing if output is piped or redirected. |
 | `--no-color` | off | Disable colored output and the startup banner. |
+| `--ignore-redirects` | off | Don't follow redirects. A target that 3xx-redirects elsewhere (e.g. to a login page) is still treated as reachable/fine — only a plain `200` counts as the clean baseline page itself; the redirect destination is never fetched or checked. |
 
 ### Ctrl+C
 
