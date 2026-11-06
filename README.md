@@ -196,6 +196,21 @@ cat subdomains.txt | ppfngr --stats
 | `--stats` | off | Multi-target mode only: a wfuzz-style live dashboard pinned to the terminal — a stats panel at the **top** (targets done/left/concurrency, elapsed/ETA/rate, system RAM + ppfngr's own memory footprint, network throughput, and request latency — labeled "tor latency" under `--tor`) plus a progress bar at the **bottom**, with normal scan output flowing in between. Needs a real terminal (stdout must be a tty) — silently does nothing if output is piped or redirected. |
 | `--no-color` | off | Disable colored output and the startup banner. |
 
+### Ctrl+C
+
+Ctrl+C pauses the scan instead of killing it — press `[c]` to continue or
+`[q]` to quit, and whatever targets finished scanning before that point
+are still written to the batch report (the report file is rewritten after
+every completed target, not just at the end, so results already on disk
+survive a `[q]` quit or even a harder kill). On Windows specifically, feed
+targets with real file redirection (`cmd /c "ppfngr --stats ... < targets.txt"`
+— PowerShell has no `<` operator at all) or a plain argument, not a
+PowerShell object pipe (`"a","b" | ppfngr ...`) if you want Ctrl+C to work
+reliably: PowerShell is documented to sometimes terminate a native process
+reading piped object input directly on Ctrl+C, bypassing the normal
+console handler before ppfngr ever gets a chance to catch it. Linux/macOS
+terminals aren't affected by this.
+
 ### Sample output
 
 Nuclei-style: one line per result (`[id] [protocol] [severity] matched-at`),
