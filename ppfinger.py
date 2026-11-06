@@ -67,10 +67,24 @@ from aiohttp_socks import ProxyConnector
 from aiohttp_socks import ProxyError as _SocksProxyError
 from aiohttp_socks import ProxyConnectionError as _SocksProxyConnectionError
 from aiohttp_socks import ProxyTimeoutError as _SocksProxyTimeoutError
-from bs4 import BeautifulSoup
+import warnings
+
+from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning, XMLParsedAsHTMLWarning
 from colorama import Fore, Style, init as colorama_init
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
+
+# Belt-and-suspenders fallback for extract_forms()/extract_links(): the
+# real fix is crawl_for_forms() skipping non-HTML Content-Types before
+# ever calling BeautifulSoup (sitemap.xml, RSS/Atom feeds, JSON API
+# responses have no forms/links worth extracting anyway), plus a
+# try/except around the parse itself so genuinely malformed markup can
+# never crash the crawl. This just silences bs4's own warning -- printed
+# straight to stderr, unprompted, looking exactly like a crash even
+# though it isn't one -- for any edge case that slips past both of those
+# (e.g. a server that mislabels XML content as text/html).
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
 
 try:
     import psutil
@@ -1132,8 +1146,17 @@ JSON_CT_HINT = re.compile(r"application/(json|.*\+json)", re.I)
 
 
 def extract_links(html, base_url):
-    soup = BeautifulSoup(html, "html.parser")
     links = set()
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        # Genuinely malformed markup can trip Python's stdlib html.parser
+        # itself (not just bs4's advisory warning) on rare enough input --
+        # crawl_for_forms() skipping non-HTML Content-Types already avoids
+        # the common cases (sitemaps, feeds, JSON), but this is the actual
+        # guarantee: a bad page is just a page with zero links, never a
+        # crashed scan.
+        return links
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
         if not href or href.startswith(("javascript:", "mailto:", "tel:", "#")):
@@ -1151,8 +1174,13 @@ def same_domain(url, root_netloc):
 
 
 def extract_forms(html, page_url):
-    soup = BeautifulSoup(html, "html.parser")
     forms = []
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        # Same guarantee as extract_links(): malformed markup degrades to
+        # "no forms found on this page", never a crashed scan.
+        return forms
     for form in soup.find_all("form"):
         action = form.get("action", "").strip()
         method = form.get("method", "get").strip().lower() or "get"
@@ -1384,6 +1412,17 @@ async def crawl_for_forms(session, start_url, max_pages, delay):
         if delay:
             await asyncio.sleep(delay)
         if resp is None or not resp.text:
+            continue
+
+        # Sitemaps, RSS/Atom feeds, JSON API responses, etc. have no
+        # forms/links worth extracting, and feeding them to an HTML parser
+        # is exactly what trips bs4's XMLParsedAsHTMLWarning (printed
+        # straight to stderr, looking like a crash even though it isn't).
+        # A present Content-Type without "html" in it is a reliable signal
+        # to skip; an absent one is common on misconfigured servers that
+        # still serve real HTML, so it falls through to parsing as before.
+        content_type = (resp.headers.get("Content-Type", "") or "").lower()
+        if content_type and "html" not in content_type:
             continue
 
         forms = extract_forms(resp.text, url)
