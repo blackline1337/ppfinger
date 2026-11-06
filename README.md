@@ -193,7 +193,7 @@ cat subdomains.txt | ppfngr --stats
 | `--concurrency N` | auto (~25% of available RAM) | How many targets to scan at once in multi-target (stdin) mode. Ignored for a single target. |
 | `--max-memory-percent N` | `85` | Live safety ceiling: pause *starting* new target scans (without touching ones already running) while system memory usage is at or above this, resume once it drops back down. Requires `psutil`. |
 | `--json` | off | Multi-target mode only: write the aggregate batch report as `ppfngr-results-<timestamp>.json` instead of a plain-text summary. |
-| `--stats` | off | Multi-target mode only: pin a live progress bar (targets done/left, elapsed time, ETA) to the bottom of the terminal while normal output scrolls above it. Needs a real terminal (stdout must be a tty) — silently does nothing if output is piped or redirected. |
+| `--stats` | off | Multi-target mode only: a wfuzz-style live dashboard pinned to the terminal — a stats panel at the **top** (targets done/left/concurrency, elapsed/ETA/rate, system RAM + ppfngr's own memory footprint, network throughput, and request latency — labeled "tor latency" under `--tor`) plus a progress bar at the **bottom**, with normal scan output flowing in between. Needs a real terminal (stdout must be a tty) — silently does nothing if output is piped or redirected. |
 | `--no-color` | off | Disable colored output and the startup banner. |
 
 ### Sample output

@@ -153,6 +153,16 @@ def c_mag(msg):
 _OUTPUT_BUF = contextvars.ContextVar("ppfngr_output_buf", default=None)
 _SEEN_ERRORS_VAR = contextvars.ContextVar("ppfngr_seen_errors", default=None)
 
+# Unlike the two above, this is deliberately a plain module-level global,
+# not a contextvar: request latency needs to be POOLED across every
+# concurrently-running target's task for the --stats dashboard (one shared
+# rolling window for the whole run), not isolated per-task. Holds the last
+# 50 successful requests' wall-clock time in milliseconds; fetch() appends,
+# StatsBar reads. Failed/timed-out requests are never recorded here -- a
+# connection refusal "finishing" in a few ms isn't a latency sample, it'd
+# just drag a real average down misleadingly.
+_LATENCY_SAMPLES_MS = deque(maxlen=50)
+
 
 def _emit(line=""):
     """Writes one line to the current task's output buffer if one has been
@@ -908,6 +918,7 @@ class _Resp:
 
 
 async def fetch(session, url, timeout=None):
+    t0 = time.monotonic()
     try:
         kwargs = {"allow_redirects": True, "ssl": False}
         if timeout is not None:
@@ -918,6 +929,7 @@ async def fetch(session, url, timeout=None):
             except (UnicodeDecodeError, LookupError):
                 raw = await resp.read()
                 text = raw.decode("utf-8", errors="replace")
+            _LATENCY_SAMPLES_MS.append((time.monotonic() - t0) * 1000)
             return _Resp(resp.status, resp.headers, text, resp.cookies)
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError,
             _SocksProxyError, _SocksProxyConnectionError, _SocksProxyTimeoutError) as e:
@@ -1559,40 +1571,67 @@ def _format_duration(seconds):
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
+def _format_rate(bytes_per_sec):
+    if bytes_per_sec >= 1024 * 1024:
+        return f"{bytes_per_sec / (1024 * 1024):.1f}MB/s"
+    if bytes_per_sec >= 1024:
+        return f"{bytes_per_sec / 1024:.1f}KB/s"
+    return f"{bytes_per_sec:.0f}B/s"
+
+
 class StatsBar(object):
-    """--stats: a one-line progress bar pinned to the bottom of the
-    terminal in multi-target mode, showing targets done/left and an ETA,
-    that stays put while the normal scrolling output (each target's
-    result block) scrolls above it.
+    """--stats: a wfuzz-style live dashboard for multi-target mode -- a
+    multi-line stats panel pinned to the TOP of the terminal (targets
+    done/left/concurrency, system RAM + ppfngr's own memory footprint,
+    system network throughput, and request latency -- labeled "tor
+    latency" under --tor, since every request in that mode really is
+    going through the circuit) plus a one-line progress bar pinned to the
+    BOTTOM (bar, done/total, elapsed, ETA), with the normal scrolling
+    output (each target's result block) flowing in between. Since the
+    batch report already captures everything stdout would show, the
+    dashboard is allowed to be the richer, primary view here rather than
+    a single unobtrusive line.
 
     How it stays put: terminals support a "scrolling region" (DECSTBM,
     `ESC[top;bottom r`) -- once set, plain output only scrolls *within*
     that region, and rows outside it are left alone no matter how much
-    gets printed. Reserving everything except the last row as the
-    scrolling region means every ordinary print() elsewhere in the
+    gets printed. Reserving the top N rows and the bottom row as the
+    region's boundaries means every ordinary print() elsewhere in the
     program (each target's block, Tor/memory-gate messages, all of it)
-    keeps working completely unchanged and simply never touches that
-    last row; separately, redrawing just that row after each target
-    completes (save cursor -> jump to the last row -> clear it -> write
-    the bar -> restore cursor) is what makes the bar itself update.
+    keeps working completely unchanged and simply never touches those
+    rows; separately, a periodic background tick (plus an immediate
+    redraw whenever a target finishes) repaints just those reserved rows
+    to update the live numbers.
 
     Entirely asyncio-single-threaded-safe without any locking: asyncio
-    only ever switches between tasks at an `await`, and nothing here
-    awaits mid-sequence, so a redraw can never be interleaved with
-    another task's print() call.
+    only ever switches between tasks at an `await`, and a redraw itself
+    never awaits mid-sequence, so it can never be interleaved with
+    another task's print() call -- the only `await` involved is the
+    ticker's own sleep between redraws.
 
     No-ops safely (status_bar.enabled stays False, every method becomes
-    a no-op) whenever the terminal doesn't look safe for this: stdout
-    isn't a real tty (piped/redirected -- common in CI, or when the user
-    tees output to a file), or the terminal is too short to spare a row."""
+    a no-op, exactly the prior behavior) whenever the terminal doesn't
+    look safe for this: stdout isn't a real tty (piped/redirected --
+    common in CI, or when output is teed to a file), or the terminal is
+    too small to spare the rows."""
 
-    def __init__(self, total):
+    TOP_HEIGHT = 5   # border + 3 content rows + border
+    BOTTOM_HEIGHT = 1
+
+    def __init__(self, total, concurrency=1, tor=False, interval=1.0):
         self.total = total
+        self.concurrency = concurrency
+        self.tor = tor
+        self.interval = interval
         self.done = 0
         self.start_time = None
         self.enabled = False
         self.rows = 0
         self.cols = 0
+        self._tick_task = None
+        self._proc = None
+        self._last_net = None
+        self._last_net_t = None
 
     def start(self):
         if not sys.stdout.isatty():
@@ -1601,21 +1640,107 @@ class StatsBar(object):
             size = shutil.get_terminal_size()
         except Exception:
             return
-        if size.lines < 5 or size.columns < 20:
-            return  # too small to usefully spare a row for this
+        min_rows = self.TOP_HEIGHT + self.BOTTOM_HEIGHT + 5  # leave real scroll room, not just the reserved rows
+        if size.lines < min_rows or size.columns < 60:
+            return
         self.rows, self.cols = size.lines, size.columns
         self.enabled = True
         self.start_time = time.monotonic()
+        if _HAS_PSUTIL:
+            try:
+                self._proc = psutil.Process()
+            except Exception:
+                self._proc = None
         try:
-            sys.stdout.write(f"\x1b[0;{self.rows - 1}r")   # reserve the last row: scroll region = rows 1..(rows-1)
-            sys.stdout.write(f"\x1b[{self.rows - 1};0H")   # park the cursor at the bottom of that region
+            scroll_top, scroll_bottom = self.TOP_HEIGHT + 1, self.rows - self.BOTTOM_HEIGHT
+            sys.stdout.write(f"\x1b[{scroll_top};{scroll_bottom}r")  # reserve top N + bottom 1 rows
+            sys.stdout.write(f"\x1b[{scroll_bottom};0H")             # park the cursor at the bottom of that region
             sys.stdout.flush()
         except Exception:
             self.enabled = False
             return
+        self._tick_task = asyncio.create_task(self._tick())
         self._draw()
 
-    def _bar_text(self):
+    async def _tick(self):
+        while True:
+            await asyncio.sleep(self.interval)
+            self._draw()
+
+    def _sample_network(self):
+        """Deltas psutil's cumulative system-wide network counters between
+        calls into a rate. System-wide, not scoped to this process alone --
+        psutil has no reliable cross-platform per-process network counter
+        without extra privileges -- so this reflects total machine traffic,
+        a reasonable proxy for "how much is this scan pushing" on a box
+        that isn't otherwise busy, not an exact attribution."""
+        now = time.monotonic()
+        try:
+            counters = psutil.net_io_counters()
+        except Exception:
+            return 0.0, 0.0
+        if self._last_net is None:
+            self._last_net, self._last_net_t = counters, now
+            return 0.0, 0.0
+        dt = now - self._last_net_t
+        if dt <= 0:
+            return 0.0, 0.0
+        bytes_delta = (counters.bytes_sent + counters.bytes_recv) - \
+            (self._last_net.bytes_sent + self._last_net.bytes_recv)
+        pkts_delta = (counters.packets_sent + counters.packets_recv) - \
+            (self._last_net.packets_sent + self._last_net.packets_recv)
+        self._last_net, self._last_net_t = counters, now
+        return bytes_delta / dt, pkts_delta / dt
+
+    def _top_panel_lines(self):
+        inner_w = max(10, self.cols - 4)  # content width inside "| " + " |"
+        elapsed = time.monotonic() - self.start_time
+        rate = self.done / elapsed if elapsed > 0 else 0.0
+        remaining = self.total - self.done
+        eta = (remaining / rate) if rate > 0 else None
+
+        row1 = (f"targets {self.done}/{self.total}  left={remaining}  concurrency={self.concurrency}  "
+                f"elapsed={_format_duration(elapsed)}  ETA={_format_duration(eta)}  rate={rate:.2f}/s")
+
+        if self._proc is not None:
+            try:
+                sysmem = psutil.virtual_memory()
+                proc_rss_mb = self._proc.memory_info().rss / (1024 * 1024)
+                bps, pps = self._sample_network()
+                row2 = (f"RAM {sysmem.used / 1e9:.1f}/{sysmem.total / 1e9:.1f}GB ({sysmem.percent:.0f}%)  "
+                        f"ppfngr {proc_rss_mb:.0f}MB  net {_format_rate(bps)}  {pps:.0f}pkt/s")
+            except Exception:
+                row2 = "RAM/net: unavailable"
+        else:
+            row2 = "RAM/net: psutil not installed"
+
+        if _LATENCY_SAMPLES_MS:
+            samples = list(_LATENCY_SAMPLES_MS)
+            avg_ms = sum(samples) / len(samples)
+            label = "tor latency" if self.tor else "latency"
+            row3 = f"{label}: avg {avg_ms:.0f}ms  last {samples[-1]:.0f}ms  (n={len(samples)})"
+        else:
+            row3 = ("tor latency" if self.tor else "latency") + ": no samples yet"
+
+        def box_row(text):
+            return chr(0x2502) + " " + text[:inner_w].ljust(inner_w) + " " + chr(0x2502)
+
+        top = chr(0x250c) + chr(0x2500) * (self.cols - 2) + chr(0x2510)
+        bottom = chr(0x2514) + chr(0x2500) * (self.cols - 2) + chr(0x2518)
+        # color applied to each already-sized plain line as a whole, never
+        # interleaved into the padding/truncation math above -- ANSI codes
+        # have zero visible width but a nonzero len(), so coloring a
+        # substring *before* ljust()/slicing would silently throw off
+        # exactly that math
+        return [
+            c_bold(c_mag(top[:self.cols])),
+            c_bold(box_row(row1)),
+            box_row(row2),
+            box_row(row3),
+            c_bold(c_mag(bottom[:self.cols])),
+        ]
+
+    def _bottom_line(self):
         elapsed = time.monotonic() - self.start_time
         pct = (self.done / self.total) if self.total else 1.0
         bar_width = max(10, min(30, self.cols - 55))
@@ -1626,17 +1751,18 @@ class StatsBar(object):
         eta = (remaining / rate) if rate > 0 else None
         text = (f"[{bar}] {self.done}/{self.total} target(s)  "
                 f"left={remaining}  elapsed={_format_duration(elapsed)}  ETA={_format_duration(eta)}")
-        return text[:max(0, self.cols - 1)]
+        return c_bold(c_mag(text[:max(0, self.cols - 1)]))
 
     def _draw(self):
         if not self.enabled:
             return
         try:
-            sys.stdout.write("\x1b[s")                  # save cursor
-            sys.stdout.write(f"\x1b[{self.rows};0H")     # jump to the reserved bottom row
-            sys.stdout.write("\x1b[2K")                  # clear it
-            sys.stdout.write(c_bold(c_mag(self._bar_text())))
-            sys.stdout.write("\x1b[u")                   # restore cursor to wherever scrolling output left off
+            parts = ["\x1b[s"]  # save cursor once for the whole batch
+            for i, text in enumerate(self._top_panel_lines(), start=1):
+                parts.append(f"\x1b[{i};0H\x1b[2K{text}")
+            parts.append(f"\x1b[{self.rows};0H\x1b[2K{self._bottom_line()}")
+            parts.append("\x1b[u")  # restore cursor to wherever scrolling output left off
+            sys.stdout.write("".join(parts))
             sys.stdout.flush()
         except Exception:
             self.enabled = False  # if the terminal chokes on this mid-run, stop touching it rather than garble output further
@@ -1648,10 +1774,13 @@ class StatsBar(object):
     def stop(self):
         if not self.enabled:
             return
+        if self._tick_task is not None:
+            self._tick_task.cancel()
+            self._tick_task = None
         try:
-            sys.stdout.write("\x1b[r")                   # reset scroll region to the full screen
-            sys.stdout.write(f"\x1b[{self.rows};0H")
-            sys.stdout.write("\x1b[2K")
+            sys.stdout.write("\x1b[r")  # reset scroll region to the full screen
+            for row in list(range(1, self.TOP_HEIGHT + 1)) + [self.rows]:
+                sys.stdout.write(f"\x1b[{row};0H\x1b[2K")
             sys.stdout.flush()
         except Exception:
             pass
@@ -2198,7 +2327,7 @@ async def amain():
             await memory_gate.wait()  # re-check right before actually starting in case it flipped while queued
             return await run_target(raw_target, args, timeout, tor_proxy_url)
 
-    stats_bar = StatsBar(len(targets)) if (multi and args.stats) else None
+    stats_bar = StatsBar(len(targets), concurrency=concurrency, tor=args.tor) if (multi and args.stats) else None
     if stats_bar:
         stats_bar.start()
 
