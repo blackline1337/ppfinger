@@ -203,7 +203,7 @@ http://target.example.com/
         charunicodeescape    Safe general-purpose second try: unicode-escapes special chars
         randomcase           Low-risk: randomizes SQL keyword casing
         between              Low-risk: swaps > / = for NOT BETWEEN / BETWEEN
-[composer-disclosure] [http] [low] http://target.example.com/ composer.json/composer.lock is exposed (confirms PHP)
+[composer-disclosure] [http] [low] http://target.example.com/ [/composer.json] [/composer.lock] is exposed
 [form-detect] [http] [info] http://target.example.com/login.php POST PHP
 [form-detect] [http] [info] http://target.example.com/search.php GET PHP
 [technology] [http] [info] http://target.example.com/ PHP/8.2.34
@@ -255,7 +255,7 @@ http://target.example.com
 [technology] [http] [info] http://target.example.com PHP/8.2.34
 [waf-detect] [http] [info] http://target.example.com ModSecurity / OWASP CRS
 [waf-tampers] [USRAM] charunicodeescape,space2comment,randomcase,apostrophemask,multiplespaces
-[composer-disclosure] [http] [low] http://target.example.com composer.json/composer.lock is exposed
+[composer-disclosure] [http] [low] http://target.example.com [/composer.json] [/composer.lock] is exposed
 [form-detect] [http] [info] http://target.example.com/login.php POST PHP
       curl commands: .\form_results-target.example.com.txt
 ```

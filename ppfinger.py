@@ -1348,14 +1348,18 @@ async def probe_composer_disclosure(session, start_url):
     """One-shot check for exposed composer.json / composer.lock, same idea
     as nuclei's laravel-eol template: a world-readable composer file is a
     PHP-only artifact (Composer is PHP's package manager), so finding one
-    is a reliable PHP signal even when no form on the page reveals it."""
+    is a reliable PHP signal even when no form on the page reveals it.
+    Checks both files (doesn't stop at the first hit) so the caller can
+    report exactly which one(s) are actually exposed. Returns a list,
+    e.g. ["composer.json"], ["composer.json", "composer.lock"], or []."""
     parsed = urlparse.urlsplit(start_url)
     root = f"{parsed.scheme}://{parsed.netloc}/"
+    exposed = []
     for path in ("composer.json", "composer.lock"):
         resp = await fetch(session, urlparse.urljoin(root, path))
         if resp is not None and resp.status_code == 200 and re.search(r'"(require|name|packages)"', resp.text or ""):
-            return True
-    return False
+            exposed.append(path)
+    return exposed
 
 
 async def crawl_for_forms(session, start_url, max_pages, delay):
@@ -1610,8 +1614,8 @@ def write_batch_report(batch_results, args):
                 fh.write(f"[rate-limit] [http] [info] {r['target']} {r['rate_limit']}\n")
 
             if r.get("composer_exposed"):
-                fh.write(f"[composer-disclosure] [http] [low] {r['target']} "
-                         f"composer.json/composer.lock is exposed\n")
+                paths_str = " ".join(f"[/{p}]" for p in r["composer_exposed"])
+                fh.write(f"[composer-disclosure] [http] [low] {r['target']} {paths_str} is exposed\n")
 
             for f in r.get("forms", []):
                 fh.write(f"[form-detect] [http] [info] {f['action']} {f['method'].upper()} {f['tech']}\n")
@@ -1635,7 +1639,7 @@ def _new_record(target):
         "tamper_verify": None,
         "tamper_names": [],  # ordered: verify-tampers ranking if that ran, else the static vendor suggestion order
         "technology": None,  # "PHP/8.2.34" / "ASPX (unknown version)" / etc. -- only PHP/ASP/ASPX ever set this
-        "composer_exposed": False,
+        "composer_exposed": [],  # e.g. ["composer.json"] or ["composer.json", "composer.lock"]
         "forms_kept": 0,
         "forms_skipped": 0,
         "forms": [],
@@ -1854,7 +1858,8 @@ async def run_target(raw_target, args, timeout, tor_proxy_url=None):
             forms, pages_fetched, composer_exposed = await crawl_for_forms(session, target, args.max_pages, args.delay)
             record["composer_exposed"] = composer_exposed
             if composer_exposed:
-                finding("composer-disclosure", "http", "low", target, "composer.json/composer.lock is exposed (confirms PHP)")
+                paths_str = " ".join(f"[/{p}]" for p in composer_exposed)
+                finding("composer-disclosure", "http", "low", target, f"{paths_str} is exposed")
                 result_count += 1
 
             kept = [f for f in forms if f["tech"] in ("PHP", "ASP", "ASPX")]
