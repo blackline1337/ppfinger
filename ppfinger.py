@@ -1652,6 +1652,9 @@ class StatsBar(object):
             except Exception:
                 self._proc = None
         try:
+            sys.stdout.write("\x1b[2J\x1b[H")  # clear the whole screen first -- the startup banner would
+                                                # otherwise sit half-scrolled, with its tail end stuck right
+                                                # under the dashboard instead of cleanly out of the way
             scroll_top, scroll_bottom = self.TOP_HEIGHT + 1, self.rows - self.BOTTOM_HEIGHT
             sys.stdout.write(f"\x1b[{scroll_top};{scroll_bottom}r")  # reserve top N + bottom 1 rows
             sys.stdout.write(f"\x1b[{scroll_bottom};0H")             # park the cursor at the bottom of that region
@@ -1725,6 +1728,11 @@ class StatsBar(object):
     # would freeze in whatever c_dim did at import time and never notice.
     _SEP_TEXT = " " + chr(0x2502) + " "
 
+    # Labels carry the color (what kind of thing, or its severity); the
+    # numbers themselves stay a uniform dim grey so they read as data
+    # against a colorful backdrop instead of the whole row competing for
+    # attention -- the inverse of the first pass, which colored the
+    # numbers and left labels grey ("the grey is annoying").
     def _row1_segments(self):
         elapsed = time.monotonic() - self.start_time
         rate = self.done / elapsed if elapsed > 0 else 0.0
@@ -1732,46 +1740,46 @@ class StatsBar(object):
         eta = (remaining / rate) if rate > 0 else None
         left_color = c_ok if remaining == 0 else c_warn
         return [
-            ("targets ", c_dim), (f"{self.done}/{self.total}", c_bold), ("  ", None),
-            (f"left={remaining}", left_color), ("  ", None),
-            (f"concurrency={self.concurrency}", c_dim),
+            ("targets ", c_info), (f"{self.done}/{self.total}", c_dim), ("  ", None),
+            ("left=", left_color), (f"{remaining}", c_dim), ("  ", None),
+            ("concurrency=", c_mag), (f"{self.concurrency}", c_dim),
             (self._SEP_TEXT, c_dim),
-            ("elapsed=", c_dim), (_format_duration(elapsed), c_info), ("  ", None),
-            ("ETA=", c_dim), (_format_duration(eta), c_info), ("  ", None),
-            ("rate=", c_dim), (f"{rate:.2f}/s", c_info),
+            ("elapsed=", c_info), (_format_duration(elapsed), c_dim), ("  ", None),
+            ("ETA=", c_mag), (_format_duration(eta), c_dim), ("  ", None),
+            ("rate=", c_info), (f"{rate:.2f}/s", c_dim),
         ]
 
     def _row2_segments(self):
         if self._proc is None:
-            return [("RAM/net: psutil not installed", c_dim)]
+            return [("RAM/net: ", c_warn), ("psutil not installed", c_dim)]
         try:
             sysmem = psutil.virtual_memory()
             proc_rss_mb = self._proc.memory_info().rss / (1024 * 1024)
             bps, pps = self._sample_network()
         except Exception:
-            return [("RAM/net: unavailable", c_dim)]
+            return [("RAM/net: ", c_warn), ("unavailable", c_dim)]
         ram_color = c_ok if sysmem.percent < 60 else (c_warn if sysmem.percent < 85 else c_bad)
         return [
-            ("RAM ", c_dim),
-            (f"{sysmem.used / 1e9:.1f}/{sysmem.total / 1e9:.1f}GB ({sysmem.percent:.0f}%)", ram_color),
+            ("RAM ", ram_color),
+            (f"{sysmem.used / 1e9:.1f}/{sysmem.total / 1e9:.1f}GB ({sysmem.percent:.0f}%)", c_dim),
             (self._SEP_TEXT, c_dim),
-            ("ppfngr ", c_dim), (f"{proc_rss_mb:.0f}MB", c_info),
+            ("ppfngr ", c_mag), (f"{proc_rss_mb:.0f}MB", c_dim),
             (self._SEP_TEXT, c_dim),
-            ("net ", c_dim), (f"{_format_rate(bps)}", c_info), ("  ", None), (f"{pps:.0f}pkt/s", c_info),
+            ("net ", c_info), (f"{_format_rate(bps)}", c_dim), ("  ", None), (f"{pps:.0f}pkt/s", c_dim),
         ]
 
     def _row3_segments(self):
         label = "tor latency" if self.tor else "latency"
         if not _LATENCY_SAMPLES_MS:
-            return [(f"{label}: ", c_dim), ("no samples yet", c_dim)]
+            return [(f"{label}: ", c_info), ("no samples yet", c_dim)]
         samples = list(_LATENCY_SAMPLES_MS)
         avg_ms = sum(samples) / len(samples)
         last_ms = samples[-1]
         lat_color = c_ok if avg_ms < 300 else (c_warn if avg_ms < 1000 else c_bad)
         return [
-            (f"{label}: ", c_dim),
-            ("avg ", c_dim), (f"{avg_ms:.0f}ms", lat_color), ("  ", None),
-            ("last ", c_dim), (f"{last_ms:.0f}ms", lat_color), ("  ", None),
+            (f"{label}: ", lat_color),
+            ("avg ", c_info), (f"{avg_ms:.0f}ms", c_dim), ("  ", None),
+            ("last ", c_mag), (f"{last_ms:.0f}ms", c_dim), ("  ", None),
             (f"(n={len(samples)})", c_dim),
         ]
 
@@ -1829,9 +1837,11 @@ class StatsBar(object):
             self._tick_task.cancel()
             self._tick_task = None
         try:
-            sys.stdout.write("\x1b[r")  # reset scroll region to the full screen
-            for row in list(range(1, self.TOP_HEIGHT + 1)) + [self.rows]:
-                sys.stdout.write(f"\x1b[{row};0H\x1b[2K")
+            sys.stdout.write("\x1b[r")        # reset scroll region to the full screen
+            sys.stdout.write("\x1b[2J\x1b[H")  # then clear it entirely -- the whole run's scrolled
+                                                # output goes with it, so the caller can print a clean
+                                                # final summary on a blank screen instead of leaving
+                                                # every target's block sitting there as leftover residue
             sys.stdout.flush()
         except Exception:
             pass
@@ -1892,7 +1902,7 @@ def _is_positive_result(r):
     return bool(r.get("technology") or r["waf"]["matched"] or r.get("forms_kept"))
 
 
-def write_batch_report(batch_results, args):
+def write_batch_report(batch_results, args, quiet=False):
     """Multi-target mode only: writes one aggregate report covering the
     run. --json writes every target's full raw data, unfiltered. Without
     it, the .txt report keeps only targets with a positive result (see
@@ -1904,7 +1914,10 @@ def write_batch_report(batch_results, args):
     `[waf-tampers] [SR] space2comment,randomcase`, instead of the full
     per-script name/reason breakdown the terminal shows. This is separate
     from the per-target form_results-*.txt curl files, which are still
-    written individually as before."""
+    written individually as before. Always returns the written path;
+    quiet=True skips this function's own "wrote X to Y" print, for a
+    caller (the --stats summary box) that wants to fold that line into
+    its own, differently-formatted summary instead of having both print."""
     os.makedirs(args.out_dir, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
 
@@ -1912,8 +1925,9 @@ def write_batch_report(batch_results, args):
         path = os.path.join(args.out_dir, f"ppfngr-results-{stamp}.json")
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(batch_results, fh, indent=2)
-        print(c_ok(f"[+] Wrote batch report ({len(batch_results)} target(s)) to {c_bold(path)}"))
-        return
+        if not quiet:
+            print(c_ok(f"[+] Wrote batch report ({len(batch_results)} target(s)) to {c_bold(path)}"))
+        return path
 
     path = os.path.join(args.out_dir, f"ppfngr-results-{stamp}.txt")
     positive = [r for r in batch_results if _is_positive_result(r)]
@@ -1952,8 +1966,43 @@ def write_batch_report(batch_results, args):
 
             fh.write("\n")
 
-    print(c_ok(f"[+] Wrote batch report ({len(positive)}/{len(batch_results)} target(s) positive) "
-               f"to {c_bold(path)}"))
+    if not quiet:
+        print(c_ok(f"[+] Wrote batch report ({len(positive)}/{len(batch_results)} target(s) positive) "
+                   f"to {c_bold(path)}"))
+    return path
+
+
+def print_summary_box(batch_results, elapsed, report_path):
+    """A clean, boxed final summary for --stats mode, printed on the blank
+    screen StatsBar.stop() just cleared -- so a run doesn't end with every
+    target's scrolled block still sitting there as leftover residue, the
+    same box style as the startup banner, built from the already-correct
+    StatsBar._colored_row() padding/truncation logic rather than
+    reimplementing it."""
+    try:
+        cols = shutil.get_terminal_size().columns if sys.stdout.isatty() else 78
+    except Exception:
+        cols = 78
+    cols = max(50, min(cols, 100))
+    inner_w = cols - 4
+
+    ok_count = sum(1 for r in batch_results if r["reachable"])
+    positive_count = sum(1 for r in batch_results if _is_positive_result(r))
+
+    def box_row(segments):
+        return c_mag(chr(0x2502)) + " " + StatsBar._colored_row(segments, inner_w) + " " + c_mag(chr(0x2502))
+
+    print(c_bold(c_mag(chr(0x250c) + chr(0x2500) * (cols - 2) + chr(0x2510))))
+    print(box_row([("ppfngr scan complete", c_bold)]))
+    print(box_row([
+        ("scanned: ", c_info), (f"{len(batch_results)}", c_dim), ("   ", None),
+        ("reachable: ", c_info), (f"{ok_count}", c_ok if ok_count == len(batch_results) else c_warn), ("   ", None),
+        ("positive: ", c_info), (f"{positive_count}", c_dim),
+    ]))
+    print(box_row([("elapsed: ", c_info), (_format_duration(elapsed), c_dim)]))
+    print(box_row([("report: ", c_info), (report_path, c_dim)]))
+    print(c_bold(c_mag(chr(0x2514) + chr(0x2500) * (cols - 2) + chr(0x2518))))
+    print()
 
 
 def _new_record(target):
@@ -2379,6 +2428,7 @@ async def amain():
             return await run_target(raw_target, args, timeout, tor_proxy_url)
 
     stats_bar = StatsBar(len(targets), concurrency=concurrency, tor=args.tor) if (multi and args.stats) else None
+    scan_start = time.monotonic()
     if stats_bar:
         stats_bar.start()
 
@@ -2409,9 +2459,19 @@ async def amain():
             stats_bar.stop()
 
     if multi:
-        ok_count = sum(1 for r in batch_results if r["reachable"])
-        print(c_bold(f"[*] Done: {c_ok(str(ok_count))} reachable / {len(batch_results)} target(s) scanned."))
-        write_batch_report(batch_results, args)
+        if stats_bar:
+            # The screen is blank now (StatsBar.stop() just cleared it) --
+            # a plain "[*] Done: ..." line would be the only thing on an
+            # otherwise empty screen, which looks like an error more than a
+            # summary. Printing the batch report quietly and folding its
+            # path into one boxed summary instead is the "nice summary
+            # afterward" the clear is for.
+            report_path = write_batch_report(batch_results, args, quiet=True)
+            print_summary_box(batch_results, time.monotonic() - scan_start, report_path)
+        else:
+            ok_count = sum(1 for r in batch_results if r["reachable"])
+            print(c_bold(f"[*] Done: {c_ok(str(ok_count))} reachable / {len(batch_results)} target(s) scanned."))
+            write_batch_report(batch_results, args)
 
     sys.exit(0 if all(r["reachable"] for r in batch_results) else 1)
 
