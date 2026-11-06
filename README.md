@@ -165,6 +165,13 @@ Scan a subdomain list concurrently and write the aggregate report as JSON:
 cat subdomains.txt | ppfngr --json --concurrency 8
 ```
 
+Scan a long subdomain list with a live progress bar pinned to the bottom
+of the terminal (targets done/left, elapsed time, ETA):
+
+```bash
+cat subdomains.txt | ppfngr --stats
+```
+
 ### Options
 
 | Flag | Default | Description |
@@ -186,6 +193,7 @@ cat subdomains.txt | ppfngr --json --concurrency 8
 | `--concurrency N` | auto (~25% of available RAM) | How many targets to scan at once in multi-target (stdin) mode. Ignored for a single target. |
 | `--max-memory-percent N` | `85` | Live safety ceiling: pause *starting* new target scans (without touching ones already running) while system memory usage is at or above this, resume once it drops back down. Requires `psutil`. |
 | `--json` | off | Multi-target mode only: write the aggregate batch report as `ppfngr-results-<timestamp>.json` instead of a plain-text summary. |
+| `--stats` | off | Multi-target mode only: pin a live progress bar (targets done/left, elapsed time, ETA) to the bottom of the terminal while normal output scrolls above it. Needs a real terminal (stdout must be a tty) — silently does nothing if output is piped or redirected. |
 | `--no-color` | off | Disable colored output and the startup banner. |
 
 ### Sample output

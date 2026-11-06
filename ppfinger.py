@@ -54,6 +54,7 @@ import json
 import os
 import random
 import re
+import shutil
 import socket
 import ssl
 import string
@@ -1549,6 +1550,114 @@ class MemoryGate:
         await self.ok.wait()
 
 
+def _format_duration(seconds):
+    if seconds is None:
+        return "--:--"
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+class StatsBar(object):
+    """--stats: a one-line progress bar pinned to the bottom of the
+    terminal in multi-target mode, showing targets done/left and an ETA,
+    that stays put while the normal scrolling output (each target's
+    result block) scrolls above it.
+
+    How it stays put: terminals support a "scrolling region" (DECSTBM,
+    `ESC[top;bottom r`) -- once set, plain output only scrolls *within*
+    that region, and rows outside it are left alone no matter how much
+    gets printed. Reserving everything except the last row as the
+    scrolling region means every ordinary print() elsewhere in the
+    program (each target's block, Tor/memory-gate messages, all of it)
+    keeps working completely unchanged and simply never touches that
+    last row; separately, redrawing just that row after each target
+    completes (save cursor -> jump to the last row -> clear it -> write
+    the bar -> restore cursor) is what makes the bar itself update.
+
+    Entirely asyncio-single-threaded-safe without any locking: asyncio
+    only ever switches between tasks at an `await`, and nothing here
+    awaits mid-sequence, so a redraw can never be interleaved with
+    another task's print() call.
+
+    No-ops safely (status_bar.enabled stays False, every method becomes
+    a no-op) whenever the terminal doesn't look safe for this: stdout
+    isn't a real tty (piped/redirected -- common in CI, or when the user
+    tees output to a file), or the terminal is too short to spare a row."""
+
+    def __init__(self, total):
+        self.total = total
+        self.done = 0
+        self.start_time = None
+        self.enabled = False
+        self.rows = 0
+        self.cols = 0
+
+    def start(self):
+        if not sys.stdout.isatty():
+            return
+        try:
+            size = shutil.get_terminal_size()
+        except Exception:
+            return
+        if size.lines < 5 or size.columns < 20:
+            return  # too small to usefully spare a row for this
+        self.rows, self.cols = size.lines, size.columns
+        self.enabled = True
+        self.start_time = time.monotonic()
+        try:
+            sys.stdout.write(f"\x1b[0;{self.rows - 1}r")   # reserve the last row: scroll region = rows 1..(rows-1)
+            sys.stdout.write(f"\x1b[{self.rows - 1};0H")   # park the cursor at the bottom of that region
+            sys.stdout.flush()
+        except Exception:
+            self.enabled = False
+            return
+        self._draw()
+
+    def _bar_text(self):
+        elapsed = time.monotonic() - self.start_time
+        pct = (self.done / self.total) if self.total else 1.0
+        bar_width = max(10, min(30, self.cols - 55))
+        filled = int(bar_width * pct)
+        bar = "#" * filled + "-" * (bar_width - filled)
+        rate = self.done / elapsed if elapsed > 0 else 0.0
+        remaining = self.total - self.done
+        eta = (remaining / rate) if rate > 0 else None
+        text = (f"[{bar}] {self.done}/{self.total} target(s)  "
+                f"left={remaining}  elapsed={_format_duration(elapsed)}  ETA={_format_duration(eta)}")
+        return text[:max(0, self.cols - 1)]
+
+    def _draw(self):
+        if not self.enabled:
+            return
+        try:
+            sys.stdout.write("\x1b[s")                  # save cursor
+            sys.stdout.write(f"\x1b[{self.rows};0H")     # jump to the reserved bottom row
+            sys.stdout.write("\x1b[2K")                  # clear it
+            sys.stdout.write(c_bold(c_mag(self._bar_text())))
+            sys.stdout.write("\x1b[u")                   # restore cursor to wherever scrolling output left off
+            sys.stdout.flush()
+        except Exception:
+            self.enabled = False  # if the terminal chokes on this mid-run, stop touching it rather than garble output further
+
+    def advance(self):
+        self.done += 1
+        self._draw()
+
+    def stop(self):
+        if not self.enabled:
+            return
+        try:
+            sys.stdout.write("\x1b[r")                   # reset scroll region to the full screen
+            sys.stdout.write(f"\x1b[{self.rows};0H")
+            sys.stdout.write("\x1b[2K")
+            sys.stdout.flush()
+        except Exception:
+            pass
+        self.enabled = False
+
+
 # --------------------------------------------------------------------------
 # 8. Main
 # --------------------------------------------------------------------------
@@ -2009,6 +2118,11 @@ async def amain():
     parser.add_argument("--json", action="store_true",
                          help="Multi-target mode only: write the aggregate batch report as JSON "
                               "(ppfngr-results-<timestamp>.json) instead of a plain-text summary.")
+    parser.add_argument("--stats", action="store_true",
+                         help="Multi-target mode only: pin a live progress bar (targets done/left, "
+                              "elapsed time, ETA) to the bottom of the terminal while normal output "
+                              "scrolls above it. Needs a real terminal (stdout must be a tty); silently "
+                              "does nothing otherwise, e.g. when output is piped or redirected to a file.")
     args = parser.parse_args()
 
     if args.forms_only and args.no_crawl:
@@ -2084,6 +2198,10 @@ async def amain():
             await memory_gate.wait()  # re-check right before actually starting in case it flipped while queued
             return await run_target(raw_target, args, timeout, tor_proxy_url)
 
+    stats_bar = StatsBar(len(targets)) if (multi and args.stats) else None
+    if stats_bar:
+        stats_bar.start()
+
     # create_task() schedules every target concurrently right away; printing
     # each one's buffered output here, in submission order, as we await them
     # back one at a time (rather than printing inside each task as soon as
@@ -2092,14 +2210,23 @@ async def amain():
     # though the actual work is genuinely running concurrently in the background.
     tasks = [asyncio.create_task(run_one(t)) for t in targets]
     batch_results = []
-    for task in tasks:
-        record = await task
-        print(record.pop("_output", ""))
-        batch_results.append(record)
-        if multi:
-            print()
-
-    memory_gate.stop()
+    try:
+        for task in tasks:
+            record = await task
+            print(record.pop("_output", ""))
+            batch_results.append(record)
+            if multi:
+                print()
+            if stats_bar:
+                stats_bar.advance()
+    finally:
+        # Always run, even on an exception/Ctrl+C mid-loop -- leaves the
+        # terminal's scroll region reset and the memory-watch task
+        # cancelled rather than abandoned, instead of only cleaning up on
+        # the happy path.
+        memory_gate.stop()
+        if stats_bar:
+            stats_bar.stop()
 
     if multi:
         ok_count = sum(1 for r in batch_results if r["reachable"])
