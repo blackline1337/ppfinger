@@ -55,6 +55,7 @@ import os
 import random
 import re
 import shutil
+import signal
 import socket
 import ssl
 import string
@@ -1624,6 +1625,7 @@ class StatsBar(object):
         self.tor = tor
         self.interval = interval
         self.done = 0
+        self.positive = 0
         self.start_time = None
         self.enabled = False
         self.rows = 0
@@ -1739,10 +1741,12 @@ class StatsBar(object):
         remaining = self.total - self.done
         eta = (remaining / rate) if rate > 0 else None
         left_color = c_ok if remaining == 0 else c_warn
+        pos_color = c_ok if self.positive > 0 else c_dim
         return [
             ("targets ", c_info), (f"{self.done}/{self.total}", c_dim), ("  ", None),
             ("left=", left_color), (f"{remaining}", c_dim), ("  ", None),
-            ("concurrency=", c_mag), (f"{self.concurrency}", c_dim),
+            ("concurrency=", c_mag), (f"{self.concurrency}", c_dim), ("  ", None),
+            ("positive=", c_info), (f"{self.positive}", pos_color),
             (self._SEP_TEXT, c_dim),
             ("elapsed=", c_info), (_format_duration(elapsed), c_dim), ("  ", None),
             ("ETA=", c_mag), (_format_duration(eta), c_dim), ("  ", None),
@@ -1826,8 +1830,29 @@ class StatsBar(object):
         except Exception:
             self.enabled = False  # if the terminal chokes on this mid-run, stop touching it rather than garble output further
 
-    def advance(self):
+    def advance(self, is_positive=False):
         self.done += 1
+        if is_positive:
+            self.positive += 1
+        self._draw()
+
+    def resume(self):
+        """Re-establishes the scroll region after a Ctrl+C pause released it
+        for the prompt -- unlike start(), this never resets start_time/done/
+        positive, since the run is continuing, not beginning."""
+        if not self.enabled:
+            return
+        try:
+            sys.stdout.write("\x1b[2J\x1b[H")
+            scroll_top, scroll_bottom = self.TOP_HEIGHT + 1, self.rows - self.BOTTOM_HEIGHT
+            sys.stdout.write(f"\x1b[{scroll_top};{scroll_bottom}r")
+            sys.stdout.write(f"\x1b[{scroll_bottom};0H")
+            sys.stdout.flush()
+        except Exception:
+            self.enabled = False
+            return
+        if self._tick_task is None or self._tick_task.done():
+            self._tick_task = asyncio.create_task(self._tick())
         self._draw()
 
     def stop(self):
@@ -1902,7 +1927,7 @@ def _is_positive_result(r):
     return bool(r.get("technology") or r["waf"]["matched"] or r.get("forms_kept"))
 
 
-def write_batch_report(batch_results, args, quiet=False):
+def write_batch_report(batch_results, args, quiet=False, path=None):
     """Multi-target mode only: writes one aggregate report covering the
     run. --json writes every target's full raw data, unfiltered. Without
     it, the .txt report keeps only targets with a positive result (see
@@ -1916,25 +1941,31 @@ def write_batch_report(batch_results, args, quiet=False):
     from the per-target form_results-*.txt curl files, which are still
     written individually as before. Always returns the written path;
     quiet=True skips this function's own "wrote X to Y" print, for a
-    caller (the --stats summary box) that wants to fold that line into
-    its own, differently-formatted summary instead of having both print."""
+    caller (the --stats summary box, or a live in-progress rewrite after
+    each target) that wants to fold that line into its own summary instead
+    of having both print, or not print at all mid-run. path, when given,
+    is written to (and overwritten on every call) in place of generating
+    a fresh timestamped filename -- what makes amain()'s "rewrite the
+    report after every completed target" live-results behavior land in
+    one file instead of a new one each time, so results already on disk
+    survive a hard kill, not just a clean --stats [q] quit."""
     os.makedirs(args.out_dir, exist_ok=True)
-    stamp = time.strftime("%Y%m%d-%H%M%S")
+    if path is None:
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        path = os.path.join(args.out_dir, f"ppfngr-results-{stamp}.{'json' if args.json else 'txt'}")
 
     if args.json:
-        path = os.path.join(args.out_dir, f"ppfngr-results-{stamp}.json")
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(batch_results, fh, indent=2)
         if not quiet:
             print(c_ok(f"[+] Wrote batch report ({len(batch_results)} target(s)) to {c_bold(path)}"))
         return path
 
-    path = os.path.join(args.out_dir, f"ppfngr-results-{stamp}.txt")
     positive = [r for r in batch_results if _is_positive_result(r)]
     omitted = len(batch_results) - len(positive)
 
     with open(path, "w", encoding="utf-8") as fh:
-        fh.write(f"ppfngr multi-target results -- {stamp}\n")
+        fh.write(f"ppfngr multi-target results -- {time.strftime('%Y%m%d-%H%M%S')}\n")
         fh.write(f"{len(positive)} target(s) with a positive result, of {len(batch_results)} scanned")
         fh.write(f" ({omitted} unreachable or nothing detected, omitted below)\n\n" if omitted else "\n\n")
 
@@ -1972,7 +2003,7 @@ def write_batch_report(batch_results, args, quiet=False):
     return path
 
 
-def print_summary_box(batch_results, elapsed, report_path):
+def print_summary_box(batch_results, elapsed, report_path, interrupted=False):
     """A clean, boxed final summary for --stats mode, printed on the blank
     screen StatsBar.stop() just cleared -- so a run doesn't end with every
     target's scrolled block still sitting there as leftover residue, the
@@ -1992,12 +2023,14 @@ def print_summary_box(batch_results, elapsed, report_path):
     def box_row(segments):
         return c_mag(chr(0x2502)) + " " + StatsBar._colored_row(segments, inner_w) + " " + c_mag(chr(0x2502))
 
+    title = "ppfngr scan interrupted (partial results)" if interrupted else "ppfngr scan complete"
+    title_color = c_warn if interrupted else c_bold
     print(c_bold(c_mag(chr(0x250c) + chr(0x2500) * (cols - 2) + chr(0x2510))))
-    print(box_row([("ppfngr scan complete", c_bold)]))
+    print(box_row([(title, title_color)]))
     print(box_row([
         ("scanned: ", c_info), (f"{len(batch_results)}", c_dim), ("   ", None),
         ("reachable: ", c_info), (f"{ok_count}", c_ok if ok_count == len(batch_results) else c_warn), ("   ", None),
-        ("positive: ", c_info), (f"{positive_count}", c_dim),
+        ("positive: ", c_info), (f"{positive_count}", c_ok if positive_count > 0 else c_dim),
     ]))
     print(box_row([("elapsed: ", c_info), (_format_duration(elapsed), c_dim)]))
     print(box_row([("report: ", c_info), (report_path, c_dim)]))
@@ -2289,6 +2322,73 @@ async def run_target(raw_target, args, timeout, tor_proxy_url=None):
         record["_output"] = "\n".join(buf) if buf else ""
 
 
+# --------------------------------------------------------------------------
+# Ctrl+C: pause-and-ask, not abort. A SIGINT handler just flips this flag --
+# never raises KeyboardInterrupt -- so there's nothing asyncio-internal to
+# race with; a small watcher task polls it and, when set, blocks on a
+# keypress right there. Since asyncio is single-threaded and cooperative,
+# that blocking call genuinely freezes every concurrently-running target
+# too (nothing else can run until it returns), which *is* the pause -- no
+# separate step to stop other tasks is needed.
+# --------------------------------------------------------------------------
+
+_sigint_flag = False
+
+
+def _on_sigint(signum, frame):
+    global _sigint_flag
+    _sigint_flag = True
+
+
+def _read_single_key():
+    """Reads one raw keypress with no Enter required, straight from the
+    controlling terminal rather than sys.stdin -- multi-target mode already
+    consumed stdin for the target list, so it may be a closed pipe, not a
+    keyboard. Returns None if there's no interactive terminal to read a
+    keypress from at all."""
+    if os.name == "nt":
+        try:
+            import msvcrt
+            return msvcrt.getch().decode(errors="replace").lower()
+        except Exception:
+            return None
+    try:
+        import termios
+        import tty
+        fd = os.open("/dev/tty", os.O_RDONLY)
+        try:
+            old = termios.tcgetattr(fd)
+            tty.setraw(fd)
+            return os.read(fd, 1).decode(errors="replace").lower()
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            os.close(fd)
+    except Exception:
+        return None
+
+
+def _pause_prompt(stats_bar):
+    """Blocks (pausing the whole scan -- see module comment above) until
+    the user picks [c] to resume or [q] to quit. Releases the --stats
+    scroll region first, if one's active, so the prompt isn't fighting the
+    reserved rows; resume() re-establishes it afterward. Returns 'q' if no
+    interactive terminal was available to read a choice from at all, same
+    as a hard Ctrl+C used to behave."""
+    if stats_bar is not None and stats_bar.enabled:
+        sys.stdout.write("\x1b[r\x1b[2J\x1b[H")
+        sys.stdout.flush()
+    print(c_warn("\n[!] Scan paused (Ctrl+C). Press [c] to continue or [q] to quit "
+                 "(results gathered so far are kept): "), end="", flush=True)
+    while True:
+        key = _read_single_key()
+        if key is None:
+            print()
+            return "q"
+        if key in ("c", "q"):
+            print(c_ok(key) if key == "c" else c_bad(key))
+            return key
+
+
 async def amain():
     parser = argparse.ArgumentParser(
         description="WAF fingerprinter + sqlmap tamper recommender + PHP/ASP(X) form finder."
@@ -2432,6 +2532,39 @@ async def amain():
     if stats_bar:
         stats_bar.start()
 
+    # Ctrl+C no longer aborts outright -- the handler just raises a flag
+    # (see _on_sigint()), and this watcher task polls it and pauses right
+    # there when set. quit_event is how it signals "the user picked [q]"
+    # back out to the loop below without raising anything through asyncio
+    # internals, which is what made a plain try/except KeyboardInterrupt
+    # here unreliable in the first place.
+    quit_event = asyncio.Event()
+
+    async def _pause_watcher():
+        global _sigint_flag
+        while True:
+            await asyncio.sleep(0.15)
+            if _sigint_flag:
+                _sigint_flag = False
+                if _pause_prompt(stats_bar) == "q":
+                    quit_event.set()
+                    return
+                if stats_bar:
+                    stats_bar.resume()
+
+    old_sigint_handler = signal.signal(signal.SIGINT, _on_sigint)
+    watcher_task = asyncio.create_task(_pause_watcher())
+
+    # Computed once so every live rewrite below (and the final one) lands
+    # in the same file instead of a new timestamped one each time -- what
+    # makes results already on disk survive a [q] quit, or even a harder
+    # kill, not just a clean finish.
+    report_path = None
+    if multi:
+        os.makedirs(args.out_dir, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        report_path = os.path.join(args.out_dir, f"ppfngr-results-{stamp}.{'json' if args.json else 'txt'}")
+
     # create_task() schedules every target concurrently right away; printing
     # each one's buffered output here, in submission order, as we await them
     # back one at a time (rather than printing inside each task as soon as
@@ -2440,20 +2573,38 @@ async def amain():
     # though the actual work is genuinely running concurrently in the background.
     tasks = [asyncio.create_task(run_one(t)) for t in targets]
     batch_results = []
+    interrupted = False
     try:
         for task in tasks:
+            quit_waiter = asyncio.ensure_future(quit_event.wait())
+            await asyncio.wait({task, quit_waiter}, return_when=asyncio.FIRST_COMPLETED)
+            if quit_event.is_set():
+                quit_waiter.cancel()
+                interrupted = True
+                break  # leave this (and every later) task to be cancelled below
+            quit_waiter.cancel()
             record = await task
             print(record.pop("_output", ""))
             batch_results.append(record)
             if multi:
                 print()
             if stats_bar:
-                stats_bar.advance()
+                stats_bar.advance(is_positive=_is_positive_result(record))
+            if report_path:
+                write_batch_report(batch_results, args, quiet=True, path=report_path)
     finally:
-        # Always run, even on an exception/Ctrl+C mid-loop -- leaves the
-        # terminal's scroll region reset and the memory-watch task
-        # cancelled rather than abandoned, instead of only cleaning up on
-        # the happy path.
+        # Always run, even on an exception/quit mid-loop -- cancels
+        # whatever's still in flight (including anything still queued
+        # behind the concurrency semaphore) and the watcher/memory-watch
+        # tasks, resets the terminal's scroll region, and restores the
+        # default Ctrl+C behavior, instead of only cleaning up on the
+        # happy path.
+        signal.signal(signal.SIGINT, old_sigint_handler)
+        watcher_task.cancel()
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, watcher_task, return_exceptions=True)
         memory_gate.stop()
         if stats_bar:
             stats_bar.stop()
@@ -2463,16 +2614,25 @@ async def amain():
             # The screen is blank now (StatsBar.stop() just cleared it) --
             # a plain "[*] Done: ..." line would be the only thing on an
             # otherwise empty screen, which looks like an error more than a
-            # summary. Printing the batch report quietly and folding its
-            # path into one boxed summary instead is the "nice summary
-            # afterward" the clear is for.
-            report_path = write_batch_report(batch_results, args, quiet=True)
-            print_summary_box(batch_results, time.monotonic() - scan_start, report_path)
+            # summary. Printing the batch report quietly (it's almost
+            # certainly already up to date from the last completed target's
+            # live rewrite above -- this just guarantees it exists even if
+            # none completed) and folding its path into one boxed summary
+            # instead is the "nice summary afterward" the clear is for.
+            write_batch_report(batch_results, args, quiet=True, path=report_path)
+            print_summary_box(batch_results, time.monotonic() - scan_start, report_path, interrupted=interrupted)
         else:
+            if interrupted:
+                print(c_warn(f"[!] Scan interrupted by user -- {len(batch_results)}/{len(targets)} "
+                             f"target(s) completed before quitting."))
             ok_count = sum(1 for r in batch_results if r["reachable"])
             print(c_bold(f"[*] Done: {c_ok(str(ok_count))} reachable / {len(batch_results)} target(s) scanned."))
-            write_batch_report(batch_results, args)
+            write_batch_report(batch_results, args, path=report_path)
+    elif interrupted:
+        print(c_warn("[!] Scan interrupted by user before it finished."))
 
+    if interrupted:
+        sys.exit(130)
     sys.exit(0 if all(r["reachable"] for r in batch_results) else 1)
 
 

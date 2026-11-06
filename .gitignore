@@ -15,3 +15,4 @@ __pycache__/
 # Build artifacts (uv build / uv tool install)
 dist/
 *.egg-info/
+temp/
